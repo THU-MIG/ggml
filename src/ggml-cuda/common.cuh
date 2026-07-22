@@ -1165,6 +1165,21 @@ struct ggml_cuda_pool_alloc {
     ggml_cuda_pool_alloc& operator=(ggml_cuda_pool_alloc &&) = delete;
 };
 
+enum ggml_cuda_mul_mat_workspace_kind {
+    GGML_CUDA_MUL_MAT_WORKSPACE_ACTIVATION = 0,
+    GGML_CUDA_MUL_MAT_WORKSPACE_OUTPUT     = 1,
+    GGML_CUDA_MUL_MAT_WORKSPACE_POINTERS   = 2,
+    GGML_CUDA_MUL_MAT_WORKSPACE_COUNT      = 3,
+};
+
+struct ggml_cuda_mul_mat_workspace_buffer {
+    void * ptr = nullptr;
+    size_t capacity = 0;
+};
+
+struct ggml_cuda_mul_mat_workspace_slot {
+    ggml_cuda_mul_mat_workspace_buffer buffers[GGML_CUDA_MUL_MAT_WORKSPACE_COUNT];
+};
 
 // backend interface
 
@@ -1460,6 +1475,8 @@ struct ggml_backend_cuda_context {
 
     // pool
     std::unique_ptr<ggml_cuda_pool> pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
+    bool mul_mat_workspace_active = false;
+    ggml_cuda_mul_mat_workspace_slot mul_mat_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
 
     static std::unique_ptr<ggml_cuda_pool> new_pool_for_device(int device, int stream_no);
 
