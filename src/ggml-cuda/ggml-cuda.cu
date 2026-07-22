@@ -152,6 +152,39 @@ struct vla_cuda_mul_mat_internal_profile_event {
     uintptr_t weight_data = 0;
     uintptr_t activation_data = 0;
     uintptr_t output_data = 0;
+    bool has_batched_layout = false;
+    bool actual_strided_batched = false;
+    bool strided_batched_possible = false;
+    bool src0_contiguous_2 = false;
+    bool src1_contiguous_2 = false;
+    int64_t lda = 0;
+    int64_t ldb = 0;
+    int64_t ldc = 0;
+    int64_t stride_a_bytes = 0;
+    int64_t stride_b_bytes = 0;
+    int64_t stride_c_bytes = 0;
+    int64_t r2 = 0;
+    int64_t r3 = 0;
+    int64_t ne02 = 0;
+    int64_t ne03 = 0;
+    int64_t ne12 = 0;
+    int64_t ne13 = 0;
+    int64_t nb02_bytes = 0;
+    int64_t nb03_bytes = 0;
+    int64_t nb12_bytes = 0;
+    int64_t nb13_bytes = 0;
+    int64_t nbd2_bytes = 0;
+    int64_t nbd3_bytes = 0;
+    uintptr_t gemm_a_base = 0;
+    uintptr_t gemm_b_base = 0;
+    uintptr_t gemm_c_base = 0;
+    std::vector<int64_t> a_offsets_bytes;
+    std::vector<int64_t> b_offsets_bytes;
+    std::vector<int64_t> c_offsets_bytes;
+    std::vector<int64_t> a_deltas_bytes;
+    std::vector<int64_t> b_deltas_bytes;
+    std::vector<int64_t> c_deltas_bytes;
+    std::string strided_batched_reason;
     double cpu_elapsed_ms = 0.0;
     bool cuda_timed = false;
 };
@@ -202,6 +235,14 @@ static std::string vla_cuda_op_profile_shape(const ggml_tensor * tensor) {
 
 static std::string vla_cuda_op_profile_type(const ggml_tensor * tensor) {
     return tensor != nullptr ? ggml_type_name(tensor->type) : "none";
+}
+
+static void vla_cuda_json_write_int64_array(std::ofstream & out, const std::vector<int64_t> & values) {
+    out << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        out << (i == 0 ? "" : ",") << values[i];
+    }
+    out << "]";
 }
 
 static vla_cuda_op_profile_event vla_cuda_op_profile_begin(
@@ -371,6 +412,132 @@ static void vla_cuda_mul_mat_internal_profile_record_cpu(
     g_vla_cuda_mul_mat_internal_profile_events.push_back(std::move(event));
 }
 
+static bool vla_cuda_constant_stride(
+        const std::vector<int64_t> & offsets,
+        int64_t * stride) {
+    if (offsets.size() <= 1) {
+        *stride = 0;
+        return true;
+    }
+
+    *stride = offsets[1] - offsets[0];
+    for (size_t i = 2; i < offsets.size(); ++i) {
+        if (offsets[i] - offsets[i - 1] != *stride) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static std::vector<int64_t> vla_cuda_adjacent_deltas(const std::vector<int64_t> & offsets) {
+    std::vector<int64_t> deltas;
+    if (offsets.size() <= 1) {
+        return deltas;
+    }
+
+    deltas.reserve(offsets.size() - 1);
+    for (size_t i = 1; i < offsets.size(); ++i) {
+        deltas.push_back(offsets[i] - offsets[i - 1]);
+    }
+    return deltas;
+}
+
+static void vla_cuda_mul_mat_internal_profile_record_batched_layout(
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t m,
+        int64_t n,
+        int64_t k,
+        int64_t batch,
+        bool actual_strided_batched,
+        bool src0_contiguous_2,
+        bool src1_contiguous_2,
+        int64_t lda,
+        int64_t ldb,
+        int64_t ldc,
+        int64_t r2,
+        int64_t r3,
+        int64_t nb02,
+        int64_t nb03,
+        int64_t nb12,
+        int64_t nb13,
+        int64_t nbd2,
+        int64_t nbd3,
+        const void * gemm_a_base,
+        const void * gemm_b_base,
+        const void * gemm_c_base) {
+    vla_cuda_mul_mat_internal_profile_event event =
+        vla_cuda_mul_mat_internal_profile_make(
+            "batched_cublas",
+            "batched_layout",
+            src0,
+            src1,
+            dst,
+            m,
+            n,
+            k,
+            batch,
+            0);
+
+    event.has_batched_layout = true;
+    event.actual_strided_batched = actual_strided_batched;
+    event.src0_contiguous_2 = src0_contiguous_2;
+    event.src1_contiguous_2 = src1_contiguous_2;
+    event.lda = lda;
+    event.ldb = ldb;
+    event.ldc = ldc;
+    event.r2 = r2;
+    event.r3 = r3;
+    event.ne02 = src0 != nullptr ? src0->ne[2] : 0;
+    event.ne03 = src0 != nullptr ? src0->ne[3] : 0;
+    event.ne12 = src1 != nullptr ? src1->ne[2] : 0;
+    event.ne13 = src1 != nullptr ? src1->ne[3] : 0;
+    event.nb02_bytes = nb02;
+    event.nb03_bytes = nb03;
+    event.nb12_bytes = nb12;
+    event.nb13_bytes = nb13;
+    event.nbd2_bytes = nbd2;
+    event.nbd3_bytes = nbd3;
+    event.gemm_a_base = reinterpret_cast<uintptr_t>(gemm_a_base);
+    event.gemm_b_base = reinterpret_cast<uintptr_t>(gemm_b_base);
+    event.gemm_c_base = reinterpret_cast<uintptr_t>(gemm_c_base);
+
+    event.a_offsets_bytes.reserve((size_t) batch);
+    event.b_offsets_bytes.reserve((size_t) batch);
+    event.c_offsets_bytes.reserve((size_t) batch);
+    for (int64_t i = 0; i < batch; ++i) {
+        const int64_t i13 = i / event.ne12;
+        const int64_t i12 = i % event.ne12;
+        const int64_t i03 = i13 / r3;
+        const int64_t i02 = i12 / r2;
+        event.a_offsets_bytes.push_back(i02*nb02 + i03*nb03);
+        event.b_offsets_bytes.push_back(i12*nb12 + i13*nb13);
+        event.c_offsets_bytes.push_back(i12*nbd2 + i13*nbd3);
+    }
+
+    bool a_constant = vla_cuda_constant_stride(event.a_offsets_bytes, &event.stride_a_bytes);
+    bool b_constant = vla_cuda_constant_stride(event.b_offsets_bytes, &event.stride_b_bytes);
+    bool c_constant = vla_cuda_constant_stride(event.c_offsets_bytes, &event.stride_c_bytes);
+    event.strided_batched_possible = a_constant && b_constant && c_constant;
+
+    event.a_deltas_bytes = vla_cuda_adjacent_deltas(event.a_offsets_bytes);
+    event.b_deltas_bytes = vla_cuda_adjacent_deltas(event.b_offsets_bytes);
+    event.c_deltas_bytes = vla_cuda_adjacent_deltas(event.c_offsets_bytes);
+
+    if (event.strided_batched_possible) {
+        event.strided_batched_reason = actual_strided_batched ? "already_strided_batched" : "constant_abc_stride";
+    } else if (!a_constant) {
+        event.strided_batched_reason = "A_address_not_constant_stride";
+    } else if (!b_constant) {
+        event.strided_batched_reason = "B_address_not_constant_stride";
+    } else {
+        event.strided_batched_reason = "C_address_not_constant_stride";
+    }
+
+    g_vla_cuda_mul_mat_internal_profile_events.push_back(std::move(event));
+}
+
 static void vla_cuda_mul_mat_internal_profile_destroy(vla_cuda_mul_mat_internal_profile_event * event) {
     if (event == nullptr) {
         return;
@@ -432,6 +599,46 @@ static void vla_cuda_mul_mat_internal_profile_flush(ggml_backend_cuda_context * 
             << ",\"weight_data\":" << event.weight_data
             << ",\"activation_data\":" << event.activation_data
             << ",\"output_data\":" << event.output_data
+            << ",\"has_batched_layout\":" << (event.has_batched_layout ? "true" : "false")
+            << ",\"actual_strided_batched\":" << (event.actual_strided_batched ? "true" : "false")
+            << ",\"strided_batched_possible\":" << (event.strided_batched_possible ? "true" : "false")
+            << ",\"strided_batched_reason\":\"" << vla_cuda_op_profile_json_escape(event.strided_batched_reason)
+            << "\",\"src0_contiguous_2\":" << (event.src0_contiguous_2 ? "true" : "false")
+            << ",\"src1_contiguous_2\":" << (event.src1_contiguous_2 ? "true" : "false")
+            << ",\"lda\":" << event.lda
+            << ",\"ldb\":" << event.ldb
+            << ",\"ldc\":" << event.ldc
+            << ",\"stride_a_bytes\":" << event.stride_a_bytes
+            << ",\"stride_b_bytes\":" << event.stride_b_bytes
+            << ",\"stride_c_bytes\":" << event.stride_c_bytes
+            << ",\"r2\":" << event.r2
+            << ",\"r3\":" << event.r3
+            << ",\"ne02\":" << event.ne02
+            << ",\"ne03\":" << event.ne03
+            << ",\"ne12\":" << event.ne12
+            << ",\"ne13\":" << event.ne13
+            << ",\"nb02_bytes\":" << event.nb02_bytes
+            << ",\"nb03_bytes\":" << event.nb03_bytes
+            << ",\"nb12_bytes\":" << event.nb12_bytes
+            << ",\"nb13_bytes\":" << event.nb13_bytes
+            << ",\"nbd2_bytes\":" << event.nbd2_bytes
+            << ",\"nbd3_bytes\":" << event.nbd3_bytes
+            << ",\"gemm_a_base\":" << event.gemm_a_base
+            << ",\"gemm_b_base\":" << event.gemm_b_base
+            << ",\"gemm_c_base\":" << event.gemm_c_base
+            << ",\"a_offsets_bytes\":";
+        vla_cuda_json_write_int64_array(out, event.a_offsets_bytes);
+        out << ",\"b_offsets_bytes\":";
+        vla_cuda_json_write_int64_array(out, event.b_offsets_bytes);
+        out << ",\"c_offsets_bytes\":";
+        vla_cuda_json_write_int64_array(out, event.c_offsets_bytes);
+        out << ",\"a_deltas_bytes\":";
+        vla_cuda_json_write_int64_array(out, event.a_deltas_bytes);
+        out << ",\"b_deltas_bytes\":";
+        vla_cuda_json_write_int64_array(out, event.b_deltas_bytes);
+        out << ",\"c_deltas_bytes\":";
+        vla_cuda_json_write_int64_array(out, event.c_deltas_bytes);
+        out
             << ",\"elapsed_ms\":" << elapsed_ms
             << ",\"timer\":\"" << (event.cuda_timed ? "cuda_event" : "cpu_wall")
             << "\"}\n";
@@ -2652,8 +2859,35 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     // broadcast factors
     const int64_t r2 = ne12/ne02;
     const int64_t r3 = ne13/ne03;
+    const size_t src1_stride_size = sizeof(cuda_t);
+    const int64_t nb12_gemm = (src1->type == src0_type) ? (int64_t) nb12 : s12*(int64_t) src1_stride_size;
+    const int64_t nb13_gemm = (src1->type == src0_type) ? (int64_t) nb13 : s13*(int64_t) src1_stride_size;
+    const bool use_strided_batched = r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2;
 
-    if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
+    if (internal_profile) {
+        vla_cuda_mul_mat_internal_profile_record_batched_layout(
+            src0, src1, dst,
+            ne01, ne11, ne10, ne12 * ne13,
+            use_strided_batched,
+            is_src0_cont_2,
+            is_src1_cont_2,
+            nb01/nb00,
+            s11,
+            ne0,
+            r2,
+            r3,
+            (int64_t) nb02,
+            (int64_t) nb03,
+            nb12_gemm,
+            nb13_gemm,
+            (int64_t) nbd2,
+            (int64_t) nbd3,
+            src0_ptr,
+            src1_ptr,
+            dst_t);
+    }
+
+    if (use_strided_batched) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? nb03/nb00 : nb02/nb00;
         const int64_t smb = ne12 == 1 ? s13       : s12;
@@ -2712,8 +2946,6 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 (int64_t) ptr_workspace_bytes,
                 (double) (ptr_alloc_t1 - ptr_alloc_t0) / 1000.0);
         }
-
-        size_t src1_stride_size = sizeof(cuda_t);
 
         const int threads_x = 16;
         const int threads_y = 16;
