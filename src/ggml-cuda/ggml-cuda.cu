@@ -130,8 +130,39 @@ struct vla_cuda_op_profile_event {
     int fused_nodes = 1;
 };
 
+struct vla_cuda_mul_mat_internal_profile_event {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t end = nullptr;
+    std::string path;
+    std::string stage;
+    std::string weight_name;
+    std::string activation_name;
+    std::string output_name;
+    std::string weight_type;
+    std::string activation_type;
+    std::string output_type;
+    std::string weight_shape;
+    std::string activation_shape;
+    std::string output_shape;
+    int64_t m = 0;
+    int64_t n = 0;
+    int64_t k = 0;
+    int64_t batch = 1;
+    int64_t workspace_bytes = 0;
+    uintptr_t weight_data = 0;
+    uintptr_t activation_data = 0;
+    uintptr_t output_data = 0;
+    double cpu_elapsed_ms = 0.0;
+    bool cuda_timed = false;
+};
+
 static bool vla_cuda_op_profile_enabled() {
     const char * value = std::getenv("VLA_CUDA_OP_PROFILE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static bool vla_cuda_mul_mat_internal_profile_enabled() {
+    const char * value = std::getenv("VLA_CUDA_MUL_MAT_INTERNAL_PROFILE");
     return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
 }
 
@@ -249,6 +280,159 @@ static void vla_cuda_op_profile_flush(
             << ",\"elapsed_ms\":" << elapsed_ms
             << "}\n";
     }
+}
+
+static thread_local std::vector<vla_cuda_mul_mat_internal_profile_event> g_vla_cuda_mul_mat_internal_profile_events;
+
+static vla_cuda_mul_mat_internal_profile_event vla_cuda_mul_mat_internal_profile_make(
+        const char * path,
+        const char * stage,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t m,
+        int64_t n,
+        int64_t k,
+        int64_t batch,
+        int64_t workspace_bytes) {
+    vla_cuda_mul_mat_internal_profile_event event;
+    event.path = path != nullptr ? path : "";
+    event.stage = stage != nullptr ? stage : "";
+    event.weight_name = src0 != nullptr ? src0->name : "";
+    event.activation_name = src1 != nullptr ? src1->name : "";
+    event.output_name = dst != nullptr ? dst->name : "";
+    event.weight_type = vla_cuda_op_profile_type(src0);
+    event.activation_type = vla_cuda_op_profile_type(src1);
+    event.output_type = vla_cuda_op_profile_type(dst);
+    event.weight_shape = vla_cuda_op_profile_shape(src0);
+    event.activation_shape = vla_cuda_op_profile_shape(src1);
+    event.output_shape = vla_cuda_op_profile_shape(dst);
+    event.m = m;
+    event.n = n;
+    event.k = k;
+    event.batch = batch;
+    event.workspace_bytes = workspace_bytes;
+    event.weight_data = reinterpret_cast<uintptr_t>(src0 != nullptr ? src0->data : nullptr);
+    event.activation_data = reinterpret_cast<uintptr_t>(src1 != nullptr ? src1->data : nullptr);
+    event.output_data = reinterpret_cast<uintptr_t>(dst != nullptr ? dst->data : nullptr);
+    return event;
+}
+
+static vla_cuda_mul_mat_internal_profile_event vla_cuda_mul_mat_internal_profile_begin(
+        cudaStream_t stream,
+        const char * path,
+        const char * stage,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t m,
+        int64_t n,
+        int64_t k,
+        int64_t batch,
+        int64_t workspace_bytes) {
+    vla_cuda_mul_mat_internal_profile_event event =
+        vla_cuda_mul_mat_internal_profile_make(
+            path, stage, src0, src1, dst, m, n, k, batch, workspace_bytes);
+    event.cuda_timed = true;
+    CUDA_CHECK(cudaEventCreate(&event.start));
+    CUDA_CHECK(cudaEventCreate(&event.end));
+    CUDA_CHECK(cudaEventRecord(event.start, stream));
+    return event;
+}
+
+static void vla_cuda_mul_mat_internal_profile_end(
+        cudaStream_t stream,
+        vla_cuda_mul_mat_internal_profile_event && event) {
+    CUDA_CHECK(cudaEventRecord(event.end, stream));
+    g_vla_cuda_mul_mat_internal_profile_events.push_back(std::move(event));
+}
+
+static void vla_cuda_mul_mat_internal_profile_record_cpu(
+        const char * path,
+        const char * stage,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        int64_t m,
+        int64_t n,
+        int64_t k,
+        int64_t batch,
+        int64_t workspace_bytes,
+        double elapsed_ms) {
+    vla_cuda_mul_mat_internal_profile_event event =
+        vla_cuda_mul_mat_internal_profile_make(
+            path, stage, src0, src1, dst, m, n, k, batch, workspace_bytes);
+    event.cpu_elapsed_ms = elapsed_ms;
+    g_vla_cuda_mul_mat_internal_profile_events.push_back(std::move(event));
+}
+
+static void vla_cuda_mul_mat_internal_profile_destroy(vla_cuda_mul_mat_internal_profile_event * event) {
+    if (event == nullptr) {
+        return;
+    }
+    if (event->start != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(event->start));
+        event->start = nullptr;
+    }
+    if (event->end != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(event->end));
+        event->end = nullptr;
+    }
+}
+
+static void vla_cuda_mul_mat_internal_profile_flush(ggml_backend_cuda_context * cuda_ctx) {
+    if (g_vla_cuda_mul_mat_internal_profile_events.empty()) {
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    const char * dir = std::getenv("VLA_CUDA_OP_PROFILE_DIR");
+    const std::string path =
+        std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") +
+        "/mul_mat_internal_profile.jsonl";
+    const char * model = std::getenv("VLA_CUDA_OP_PROFILE_MODEL");
+    const char * phase = std::getenv("VLA_CUDA_OP_PROFILE_PHASE");
+
+    static std::mutex file_mutex;
+    std::lock_guard<std::mutex> lock(file_mutex);
+    std::ofstream out(path, std::ios::app);
+    for (vla_cuda_mul_mat_internal_profile_event & event :
+            g_vla_cuda_mul_mat_internal_profile_events) {
+        float cuda_elapsed_ms = 0.0f;
+        if (event.cuda_timed) {
+            CUDA_CHECK(cudaEventElapsedTime(&cuda_elapsed_ms, event.start, event.end));
+        }
+        const double elapsed_ms =
+            event.cuda_timed ? (double) cuda_elapsed_ms : event.cpu_elapsed_ms;
+        out << "{\"model\":\""
+            << vla_cuda_op_profile_json_escape(model != nullptr ? model : "")
+            << "\",\"phase\":\""
+            << vla_cuda_op_profile_json_escape(phase != nullptr ? phase : "ggml_cuda")
+            << "\",\"path\":\"" << vla_cuda_op_profile_json_escape(event.path)
+            << "\",\"stage\":\"" << vla_cuda_op_profile_json_escape(event.stage)
+            << "\",\"weight_name\":\"" << vla_cuda_op_profile_json_escape(event.weight_name)
+            << "\",\"activation_name\":\"" << vla_cuda_op_profile_json_escape(event.activation_name)
+            << "\",\"output_name\":\"" << vla_cuda_op_profile_json_escape(event.output_name)
+            << "\",\"weight_type\":\"" << event.weight_type
+            << "\",\"activation_type\":\"" << event.activation_type
+            << "\",\"output_type\":\"" << event.output_type
+            << "\",\"weight_shape\":" << event.weight_shape
+            << ",\"activation_shape\":" << event.activation_shape
+            << ",\"output_shape\":" << event.output_shape
+            << ",\"m\":" << event.m
+            << ",\"n\":" << event.n
+            << ",\"k\":" << event.k
+            << ",\"batch\":" << event.batch
+            << ",\"workspace_bytes\":" << event.workspace_bytes
+            << ",\"weight_data\":" << event.weight_data
+            << ",\"activation_data\":" << event.activation_data
+            << ",\"output_data\":" << event.output_data
+            << ",\"elapsed_ms\":" << elapsed_ms
+            << ",\"timer\":\"" << (event.cuda_timed ? "cuda_event" : "cpu_wall")
+            << "\"}\n";
+        vla_cuda_mul_mat_internal_profile_destroy(&event);
+    }
+    g_vla_cuda_mul_mat_internal_profile_events.clear();
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -1631,6 +1815,7 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
+    const bool internal_profile = vla_cuda_mul_mat_internal_profile_enabled();
 
     const bool use_fp16 =
         src0->type != GGML_TYPE_NVFP4 &&
@@ -1645,28 +1830,78 @@ static void ggml_cuda_op_mul_mat_cublas(
             const to_bf16_cuda_t to_bf16_cuda = ggml_get_to_bf16_cuda(src1->type);
             GGML_ASSERT(to_bf16_cuda != nullptr);
             size_t ne = src1_ncols*ne10;
+            const int64_t alloc_t0 = ggml_time_us();
             src1_as_bf16.alloc(ne);
-            to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), ne, stream);
+            const int64_t alloc_t1 = ggml_time_us();
+            if (internal_profile) {
+                vla_cuda_mul_mat_internal_profile_record_cpu(
+                    "cublas_bf16", "activation_workspace_alloc",
+                    src0, src1, dst, row_diff, src1_ncols, ne10, 1,
+                    (int64_t) (ne * sizeof(nv_bfloat16)),
+                    (double) (alloc_t1 - alloc_t0) / 1000.0);
+                auto event = vla_cuda_mul_mat_internal_profile_begin(
+                    stream, "cublas_bf16", "activation_convert",
+                    src0, src1, dst, row_diff, src1_ncols, ne10, 1,
+                    (int64_t) (ne * sizeof(nv_bfloat16)));
+                to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), ne, stream);
+                vla_cuda_mul_mat_internal_profile_end(stream, std::move(event));
+            } else {
+                to_bf16_cuda(src1_ddf_i, src1_as_bf16.get(), ne, stream);
+            }
         }
         const nv_bfloat16 * src1_ptr = src1->type == GGML_TYPE_BF16 ? (const nv_bfloat16 *) src1_ddf_i : src1_as_bf16.get();
         const nv_bfloat16 * src0_ptr = (const nv_bfloat16 *)src0_dd_i;
-        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id), row_diff*src1_ncols);
+        ggml_cuda_pool_alloc<nv_bfloat16> dst_bf16(ctx.pool(id));
+        const int64_t dst_alloc_t0 = ggml_time_us();
+        dst_bf16.alloc(row_diff*src1_ncols);
+        const int64_t dst_alloc_t1 = ggml_time_us();
+        if (internal_profile) {
+            vla_cuda_mul_mat_internal_profile_record_cpu(
+                "cublas_bf16", "output_workspace_alloc",
+                src0, src1, dst, row_diff, src1_ncols, ne10, 1,
+                (int64_t) (row_diff * src1_ncols * sizeof(nv_bfloat16)),
+                (double) (dst_alloc_t1 - dst_alloc_t0) / 1000.0);
+        }
 
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
         CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
-        CUBLAS_CHECK(
-            cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
-                    row_diff, src1_ncols, ne10,
-                    &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
-                                 src1_ptr,       CUDA_R_16BF, ne10,
-                    &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                stream, "cublas_bf16", "gemm",
+                src0, src1, dst, row_diff, src1_ncols, ne10, 1, 0);
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                     src1_ptr,       CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            vla_cuda_mul_mat_internal_profile_end(stream, std::move(event));
+        } else {
+            CUBLAS_CHECK(
+                cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                        row_diff, src1_ncols, ne10,
+                        &alpha_f32,  src0_ptr,       CUDA_R_16BF, ne00,
+                                     src1_ptr,       CUDA_R_16BF, ne10,
+                        &beta_f32,   dst_bf16.get(), CUDA_R_16BF, ldc,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
 
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
-        to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                stream, "cublas_bf16", "output_convert",
+                src0, src1, dst, row_diff, src1_ncols, ne10, 1,
+                (int64_t) (row_diff * src1_ncols * sizeof(nv_bfloat16)));
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+            vla_cuda_mul_mat_internal_profile_end(stream, std::move(event));
+        } else {
+            to_fp32_cuda(dst_bf16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+        }
     } else if (fast_fp16_hardware_available(cc) && use_fp16) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
@@ -2187,6 +2422,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+    const bool internal_profile = vla_cuda_mul_mat_internal_profile_enabled();
 
     float * dst_ddf = (float *) dst->data;
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -2213,11 +2449,29 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
     } else {
         // Convert src1 to target type using traits conversion functions
         const int64_t ne_src1 = ggml_nelements(src1);
+        const int64_t alloc_t0 = ggml_time_us();
         src1_alloc.alloc(ne_src1);
+        const int64_t alloc_t1 = ggml_time_us();
+        if (internal_profile) {
+            vla_cuda_mul_mat_internal_profile_record_cpu(
+                "batched_cublas", "activation_workspace_alloc",
+                src0, src1, dst, ne01, ne11, ne10, ne12 * ne13,
+                (int64_t) (ne_src1 * sizeof(cuda_t)),
+                (double) (alloc_t1 - alloc_t0) / 1000.0);
+        }
 
         const auto convert_func = traits::get_nc_converter(src1->type);
         GGML_ASSERT(convert_func != nullptr);
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                main_stream, "batched_cublas", "activation_convert",
+                src0, src1, dst, ne01, ne11, ne10, ne12 * ne13,
+                (int64_t) (ne_src1 * sizeof(cuda_t)));
+            convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+            vla_cuda_mul_mat_internal_profile_end(main_stream, std::move(event));
+        } else {
         convert_func(src1->data, src1_alloc.get(), ne10, ne11, ne12, ne13, s11, s12, s13, main_stream);
+        }
         src1_ptr = src1_alloc.get();
         s11 = ne10;
         s12 = ne11*s11;
@@ -2258,7 +2512,16 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
         if constexpr (src0_type == GGML_TYPE_F32) {
             dst_t = (char *) dst_ddf;  // Direct F32 output
         } else {
+            const int64_t alloc_t0 = ggml_time_us();
             dst_t = (char *) dst_temp.alloc(ne_dst);
+            const int64_t alloc_t1 = ggml_time_us();
+            if (internal_profile) {
+                vla_cuda_mul_mat_internal_profile_record_cpu(
+                    "batched_cublas", "output_workspace_alloc",
+                    src0, src1, dst, ne01, ne11, ne10, ne12 * ne13,
+                    (int64_t) (ne_dst * sizeof(cuda_t)),
+                    (double) (alloc_t1 - alloc_t0) / 1000.0);
+            }
             nbd2 /= sizeof(float) / sizeof(cuda_t);
             nbd3 /= sizeof(float) / sizeof(cuda_t);
         }
@@ -2284,21 +2547,46 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
 
         // there is no broadcast and src0, src1 are contiguous across dims 2, 3
         // use cublasGemmStridedBatchedEx
-        CUBLAS_CHECK(
-        cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                ne01, ne11, ne10,
-                alpha, src0_ptr, cu_data_type_a, nb01/nb00, sma,     // strideA
-                       src1_ptr, cu_data_type_b, s11,       smb,     // strideB
-                beta,     dst_t, cu_data_type,   ne0,       ne1*ne0, // strideC
-                ne12*ne13,
-                cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                main_stream, "batched_cublas", "gemm_strided_batched",
+                src0, src1, dst, ne01, ne11, ne10, ne12 * ne13, 0);
+            CUBLAS_CHECK(
+            cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, src0_ptr, cu_data_type_a, nb01/nb00, sma,     // strideA
+                           src1_ptr, cu_data_type_b, s11,       smb,     // strideB
+                    beta,     dst_t, cu_data_type,   ne0,       ne1*ne0, // strideC
+                    ne12*ne13,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            vla_cuda_mul_mat_internal_profile_end(main_stream, std::move(event));
+        } else {
+            CUBLAS_CHECK(
+            cublasGemmStridedBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, src0_ptr, cu_data_type_a, nb01/nb00, sma,     // strideA
+                           src1_ptr, cu_data_type_b, s11,       smb,     // strideB
+                    beta,     dst_t, cu_data_type,   ne0,       ne1*ne0, // strideC
+                    ne12*ne13,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     } else {
         // use cublasGemmBatchedEx
         const int64_t ne23 = ne12*ne13;
 
+        const int64_t ptr_alloc_t0 = ggml_time_us();
         ggml_cuda_pool_alloc<const void *> ptrs_src(ctx.pool(), 2*ne23);
         ggml_cuda_pool_alloc<      void *> ptrs_dst(ctx.pool(), 1*ne23);
+        const int64_t ptr_alloc_t1 = ggml_time_us();
+        if (internal_profile) {
+            vla_cuda_mul_mat_internal_profile_record_cpu(
+                "batched_cublas", "pointer_workspace_alloc",
+                src0, src1, dst, ne01, ne11, ne10, ne23,
+                (int64_t) (3 * ne23 * sizeof(void *)),
+                (double) (ptr_alloc_t1 - ptr_alloc_t0) / 1000.0);
+        }
 
         size_t src1_stride_size = sizeof(cuda_t);
 
@@ -2310,7 +2598,24 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
             (ne13 + threads_x - 1) / threads_x,
             (ne12 + threads_y - 1) / threads_y
         );
-        k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                main_stream, "batched_cublas", "pointer_setup",
+                src0, src1, dst, ne01, ne11, ne10, ne23,
+                (int64_t) (3 * ne23 * sizeof(void *)));
+            k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
+                    src0_ptr, src1_ptr, dst_t,
+                    ptrs_src.get(), ptrs_dst.get(),
+                    ne12, ne13,
+                    ne23,
+                    nb02, nb03,
+                    (src1->type == src0_type) ? nb12 : s12*src1_stride_size,
+                    (src1->type == src0_type) ? nb13 : s13*src1_stride_size,
+                    nbd2, nbd3,
+                    r2, r3);
+            vla_cuda_mul_mat_internal_profile_end(main_stream, std::move(event));
+        } else {
+            k_compute_batched_ptrs<<<grid_dims, block_dims, 0, main_stream>>>(
                 src0_ptr, src1_ptr, dst_t,
                 ptrs_src.get(), ptrs_dst.get(),
                 ne12, ne13,
@@ -2320,24 +2625,50 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
                 (src1->type == src0_type) ? nb13 : s13*src1_stride_size,
                 nbd2, nbd3,
                 r2, r3);
+        }
 
         CUDA_CHECK(cudaGetLastError());
 
-        CUBLAS_CHECK(
-        cublasGemmBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
-                ne01, ne11, ne10,
-                alpha, (const void **) (ptrs_src.get() + 0*ne23), cu_data_type_a, nb01/nb00,
-                       (const void **) (ptrs_src.get() + 1*ne23), cu_data_type_b, s11,
-                beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
-                ne23,
-                cu_compute_type,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                main_stream, "batched_cublas", "gemm_batched",
+                src0, src1, dst, ne01, ne11, ne10, ne23, 0);
+            CUBLAS_CHECK(
+            cublasGemmBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, (const void **) (ptrs_src.get() + 0*ne23), cu_data_type_a, nb01/nb00,
+                           (const void **) (ptrs_src.get() + 1*ne23), cu_data_type_b, s11,
+                    beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
+                    ne23,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            vla_cuda_mul_mat_internal_profile_end(main_stream, std::move(event));
+        } else {
+            CUBLAS_CHECK(
+            cublasGemmBatchedEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, (const void **) (ptrs_src.get() + 0*ne23), cu_data_type_a, nb01/nb00,
+                           (const void **) (ptrs_src.get() + 1*ne23), cu_data_type_b, s11,
+                    beta,  (      void **) (ptrs_dst.get() + 0*ne23), cu_data_type,   ne0,
+                    ne23,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
     }
 
     // Convert output back to F32 if needed
     if (dst->op_params[0] == GGML_PREC_DEFAULT && cu_data_type != CUDA_R_32F) {
         const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
-        to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
+        if (internal_profile) {
+            auto event = vla_cuda_mul_mat_internal_profile_begin(
+                main_stream, "batched_cublas", "output_convert",
+                src0, src1, dst, ne01, ne11, ne10, ne12 * ne13,
+                (int64_t) (ne_dst * sizeof(cuda_t)));
+            to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
+            vla_cuda_mul_mat_internal_profile_end(main_stream, std::move(event));
+        } else {
+            to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
+        }
     }
 }
 
@@ -4412,6 +4743,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         for (vla_cuda_op_profile_event & event : profile_events) {
             vla_cuda_op_profile_destroy(&event);
         }
+    }
+    if (vla_cuda_mul_mat_internal_profile_enabled()) {
+        vla_cuda_mul_mat_internal_profile_flush(cuda_ctx);
     }
 }
 
