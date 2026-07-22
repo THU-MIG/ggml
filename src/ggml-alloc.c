@@ -1049,18 +1049,23 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 }
 
 bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    const int64_t profile_t0 = ggml_time_us();
     if (ggml_gallocr_needs_realloc(galloc, graph)) {
         if (galloc->n_buffers == 1) {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: reallocating buffers automatically\n", __func__);
 #endif
             if (!ggml_gallocr_reserve(galloc, graph)) {
+                const int64_t profile_t1 = ggml_time_us();
+                ggml_backend_profile_record_alloc((double) (profile_t1 - profile_t0) / 1000.0, 0, graph ? (uint64_t) graph->n_nodes : 0);
                 return false;
             }
         } else {
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: cannot reallocate multi buffer graph automatically, call reserve\n", __func__);
 #endif
+            const int64_t profile_t1 = ggml_time_us();
+            ggml_backend_profile_record_alloc((double) (profile_t1 - profile_t0) / 1000.0, 0, graph ? (uint64_t) graph->n_nodes : 0);
             return false;
         }
     }
@@ -1093,6 +1098,12 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
         ggml_gallocr_init_tensor(galloc, node, &node_alloc->dst);
     }
 
+    size_t profile_buffer_bytes = 0;
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        profile_buffer_bytes += ggml_gallocr_get_buffer_size(galloc, i);
+    }
+    const int64_t profile_t1 = ggml_time_us();
+    ggml_backend_profile_record_alloc((double) (profile_t1 - profile_t0) / 1000.0, profile_buffer_bytes, graph ? (uint64_t) graph->n_nodes : 0);
     return true;
 }
 

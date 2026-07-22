@@ -72,6 +72,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cfloat>
+#include <cstring>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -114,6 +116,139 @@ int ggml_cuda_get_device() {
     int id;
     CUDA_CHECK(cudaGetDevice(&id));
     return id;
+}
+
+struct vla_cuda_op_profile_event {
+    cudaEvent_t start = nullptr;
+    cudaEvent_t end = nullptr;
+    std::string op;
+    std::string node_name;
+    std::string src0_type;
+    std::string src1_type;
+    std::string dst_type;
+    std::string shape;
+    int fused_nodes = 1;
+};
+
+static bool vla_cuda_op_profile_enabled() {
+    const char * value = std::getenv("VLA_CUDA_OP_PROFILE");
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+}
+
+static std::string vla_cuda_op_profile_json_escape(const std::string & value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char c : value) {
+        switch (c) {
+            case '\\': escaped += "\\\\"; break;
+            case '"':  escaped += "\\\""; break;
+            case '\n': escaped += "\\n";  break;
+            case '\r': escaped += "\\r";  break;
+            case '\t': escaped += "\\t";  break;
+            default:   escaped += c;       break;
+        }
+    }
+    return escaped;
+}
+
+static std::string vla_cuda_op_profile_shape(const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        return "[]";
+    }
+    std::string out = "[";
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        out += (i == 0 ? "" : ",");
+        out += std::to_string(tensor->ne[i]);
+    }
+    out += "]";
+    return out;
+}
+
+static std::string vla_cuda_op_profile_type(const ggml_tensor * tensor) {
+    return tensor != nullptr ? ggml_type_name(tensor->type) : "none";
+}
+
+static vla_cuda_op_profile_event vla_cuda_op_profile_begin(
+        cudaStream_t stream,
+        const ggml_tensor * node,
+        int fused_nodes) {
+    vla_cuda_op_profile_event event;
+    event.op = node != nullptr ? ggml_op_name(node->op) : "none";
+    event.node_name = node != nullptr ? node->name : "";
+    event.src0_type = node != nullptr ? vla_cuda_op_profile_type(node->src[0]) : "none";
+    event.src1_type = node != nullptr ? vla_cuda_op_profile_type(node->src[1]) : "none";
+    event.dst_type = vla_cuda_op_profile_type(node);
+    event.shape = vla_cuda_op_profile_shape(node);
+    event.fused_nodes = fused_nodes;
+    CUDA_CHECK(cudaEventCreate(&event.start));
+    CUDA_CHECK(cudaEventCreate(&event.end));
+    CUDA_CHECK(cudaEventRecord(event.start, stream));
+    return event;
+}
+
+static void vla_cuda_op_profile_end(
+        cudaStream_t stream,
+        vla_cuda_op_profile_event && event,
+        std::vector<vla_cuda_op_profile_event> * events) {
+    CUDA_CHECK(cudaEventRecord(event.end, stream));
+    if (events != nullptr) {
+        events->push_back(std::move(event));
+    }
+}
+
+static void vla_cuda_op_profile_destroy(vla_cuda_op_profile_event * event) {
+    if (event == nullptr) {
+        return;
+    }
+    if (event->start != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(event->start));
+        event->start = nullptr;
+    }
+    if (event->end != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(event->end));
+        event->end = nullptr;
+    }
+}
+
+static void vla_cuda_op_profile_flush(
+        ggml_backend_cuda_context * cuda_ctx,
+        const std::vector<vla_cuda_op_profile_event> & events,
+        const char * graph_mode) {
+    if (events.empty()) {
+        return;
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    const char * dir = std::getenv("VLA_CUDA_OP_PROFILE_DIR");
+    const std::string path =
+        std::string(dir != nullptr && dir[0] != '\0' ? dir : ".") +
+        "/op_profile.jsonl";
+    const char * model = std::getenv("VLA_CUDA_OP_PROFILE_MODEL");
+    const char * phase = std::getenv("VLA_CUDA_OP_PROFILE_PHASE");
+
+    static std::mutex file_mutex;
+    std::lock_guard<std::mutex> lock(file_mutex);
+    std::ofstream out(path, std::ios::app);
+    for (const vla_cuda_op_profile_event & event : events) {
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, event.start, event.end));
+        out << "{\"model\":\""
+            << vla_cuda_op_profile_json_escape(model != nullptr ? model : "")
+            << "\",\"phase\":\""
+            << vla_cuda_op_profile_json_escape(phase != nullptr ? phase : "ggml_cuda")
+            << "\",\"graph_mode\":\""
+            << vla_cuda_op_profile_json_escape(graph_mode != nullptr ? graph_mode : "")
+            << "\",\"op\":\"" << vla_cuda_op_profile_json_escape(event.op)
+            << "\",\"node\":\"" << vla_cuda_op_profile_json_escape(event.node_name)
+            << "\",\"src0_type\":\"" << event.src0_type
+            << "\",\"src1_type\":\"" << event.src1_type
+            << "\",\"dst_type\":\"" << event.dst_type
+            << "\",\"shape\":" << event.shape
+            << ",\"fused_nodes\":" << event.fused_nodes
+            << ",\"elapsed_ms\":" << elapsed_ms
+            << "}\n";
+    }
 }
 
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
@@ -4026,6 +4161,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    const bool profile_enabled = vla_cuda_op_profile_enabled();
+    std::vector<vla_cuda_op_profile_event> profile_events;
+    if (profile_enabled) {
+        profile_events.reserve(cgraph != nullptr ? cgraph->n_nodes : 0);
+    }
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4170,7 +4310,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = 0;
+                if (profile_enabled) {
+                    vla_cuda_op_profile_event profile_event =
+                        vla_cuda_op_profile_begin(cuda_ctx->stream(), node, 1);
+                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                    if (nodes_to_skip != 0) {
+                        profile_event.fused_nodes = nodes_to_skip + 1;
+                        vla_cuda_op_profile_end(
+                            cuda_ctx->stream(),
+                            std::move(profile_event),
+                            &profile_events);
+                        i += nodes_to_skip;
+                        continue;
+                    }
+                    vla_cuda_op_profile_destroy(&profile_event);
+                } else {
+                    nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                }
 
                 if (nodes_to_skip != 0) {
                     i += nodes_to_skip;
@@ -4189,7 +4346,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                vla_cuda_op_profile_event profile_event;
+                if (profile_enabled) {
+                    profile_event =
+                        vla_cuda_op_profile_begin(cuda_ctx->stream(), node, 1);
+                }
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                if (profile_enabled) {
+                    vla_cuda_op_profile_end(
+                        cuda_ctx->stream(),
+                        std::move(profile_event),
+                        &profile_events);
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -4235,6 +4403,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
+    }
+    if (profile_enabled) {
+        vla_cuda_op_profile_flush(
+            cuda_ctx,
+            profile_events,
+            use_cuda_graph ? "cuda_graph" : "direct");
+        for (vla_cuda_op_profile_event & event : profile_events) {
+            vla_cuda_op_profile_destroy(&event);
+        }
     }
 }
 

@@ -104,6 +104,25 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_graph_compute      (ggml_backend_t backend, struct ggml_cgraph * cgraph);
     GGML_API enum ggml_status ggml_backend_graph_compute_async(ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
+    struct ggml_backend_profile_stats {
+        double alloc_ms;
+        double input_copy_ms;
+        double output_copy_ms;
+        double compute_ms;
+        uint64_t alloc_calls;
+        uint64_t input_copy_calls;
+        uint64_t output_copy_calls;
+        uint64_t compute_calls;
+        uint64_t input_copy_bytes;
+        uint64_t output_copy_bytes;
+        uint64_t compute_buffer_bytes;
+        uint64_t graph_nodes;
+    };
+
+    GGML_API void ggml_backend_profile_reset(void);
+    GGML_API void ggml_backend_profile_get(struct ggml_backend_profile_stats * stats);
+    GGML_API void ggml_backend_profile_record_alloc(double elapsed_ms, uint64_t buffer_bytes, uint64_t graph_nodes);
+
     // NOTE: will be removed, use device version instead
     GGML_API bool ggml_backend_supports_op(ggml_backend_t backend, const struct ggml_tensor * op);
     GGML_API bool ggml_backend_supports_buft(ggml_backend_t backend, ggml_backend_buffer_type_t buft);

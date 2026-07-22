@@ -27,6 +27,56 @@
 #include <sys/sysctl.h>
 #endif
 
+struct ggml_backend_profile_state {
+    double alloc_ms = 0.0;
+    double input_copy_ms = 0.0;
+    double output_copy_ms = 0.0;
+    double compute_ms = 0.0;
+    uint64_t alloc_calls = 0;
+    uint64_t input_copy_calls = 0;
+    uint64_t output_copy_calls = 0;
+    uint64_t compute_calls = 0;
+    uint64_t input_copy_bytes = 0;
+    uint64_t output_copy_bytes = 0;
+    uint64_t compute_buffer_bytes = 0;
+    uint64_t graph_nodes = 0;
+};
+
+static thread_local ggml_backend_profile_state g_backend_profile;
+
+static double ggml_backend_profile_elapsed_ms(int64_t start_us, int64_t end_us) {
+    return (double) (end_us - start_us) / 1000.0;
+}
+
+void ggml_backend_profile_reset(void) {
+    g_backend_profile = ggml_backend_profile_state{};
+}
+
+void ggml_backend_profile_get(struct ggml_backend_profile_stats * stats) {
+    if (stats == nullptr) {
+        return;
+    }
+    stats->alloc_ms = g_backend_profile.alloc_ms;
+    stats->input_copy_ms = g_backend_profile.input_copy_ms;
+    stats->output_copy_ms = g_backend_profile.output_copy_ms;
+    stats->compute_ms = g_backend_profile.compute_ms;
+    stats->alloc_calls = g_backend_profile.alloc_calls;
+    stats->input_copy_calls = g_backend_profile.input_copy_calls;
+    stats->output_copy_calls = g_backend_profile.output_copy_calls;
+    stats->compute_calls = g_backend_profile.compute_calls;
+    stats->input_copy_bytes = g_backend_profile.input_copy_bytes;
+    stats->output_copy_bytes = g_backend_profile.output_copy_bytes;
+    stats->compute_buffer_bytes = g_backend_profile.compute_buffer_bytes;
+    stats->graph_nodes = g_backend_profile.graph_nodes;
+}
+
+void ggml_backend_profile_record_alloc(double elapsed_ms, uint64_t buffer_bytes, uint64_t graph_nodes) {
+    g_backend_profile.alloc_ms += elapsed_ms;
+    g_backend_profile.alloc_calls += 1;
+    g_backend_profile.compute_buffer_bytes += buffer_bytes;
+    g_backend_profile.graph_nodes += graph_nodes;
+}
+
 
 // backend buffer type
 
@@ -333,7 +383,12 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
+    const int64_t t0 = ggml_time_us();
     buf->iface.set_tensor(buf, tensor, data, offset, size);
+    const int64_t t1 = ggml_time_us();
+    g_backend_profile.input_copy_ms += ggml_backend_profile_elapsed_ms(t0, t1);
+    g_backend_profile.input_copy_calls += 1;
+    g_backend_profile.input_copy_bytes += size;
 }
 
 void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -348,7 +403,12 @@ void ggml_backend_tensor_get(const struct ggml_tensor * tensor, void * data, siz
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor read out of bounds");
 
+    const int64_t t0 = ggml_time_us();
     buf->iface.get_tensor(buf, tensor, data, offset, size);
+    const int64_t t1 = ggml_time_us();
+    g_backend_profile.output_copy_ms += ggml_backend_profile_elapsed_ms(t0, t1);
+    g_backend_profile.output_copy_calls += 1;
+    g_backend_profile.output_copy_bytes += size;
 }
 
 void ggml_backend_tensor_set_2d(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size,
@@ -442,8 +502,13 @@ enum ggml_status ggml_backend_graph_plan_compute(ggml_backend_t backend, ggml_ba
 }
 
 enum ggml_status ggml_backend_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    const int64_t t0 = ggml_time_us();
     enum ggml_status err = ggml_backend_graph_compute_async(backend, cgraph);
     ggml_backend_synchronize(backend);
+    const int64_t t1 = ggml_time_us();
+    g_backend_profile.compute_ms += ggml_backend_profile_elapsed_ms(t0, t1);
+    g_backend_profile.compute_calls += 1;
+    g_backend_profile.graph_nodes += cgraph != nullptr ? (uint64_t) cgraph->n_nodes : 0;
     return err;
 }
 
