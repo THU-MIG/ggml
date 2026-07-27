@@ -88,6 +88,9 @@
 #ifdef ED_ENABLE_CUDA_MODULATION
 #include "ed_cuda_modulation.h"
 #endif
+#ifdef ED_ENABLE_CUDA_SAGE_ATTN
+#include "ed_cuda_sage_attn.h"
+#endif
 #ifdef ED_ENABLE_CUDA_NORM
 #include "ed_cuda_norm.h"
 #endif
@@ -2933,6 +2936,57 @@ static __global__ void k_flux_sp_gelu_to_bf16(
     dst[idx] = __float2bfloat16(ggml_cuda_op_gelu_single(v));
 }
 
+#ifdef ED_ENABLE_CUDA_SAGE_ATTN
+// Allocate scratch from the CUDA pool (CUDA-graph-capture safe) and run the
+// SageAttention2-style fused INT8-QK + F16-PV attention. Returns false if the
+// op is unsupported so the caller can fall through.
+static bool ed_cuda_sage_attn_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ed_cuda_sage_attn_custom_supported(dst)) {
+        return false;
+    }
+    if (getenv("ED_SAGE_ATTN_DEBUG")) {
+        fprintf(stderr, "[sage] dispatch: running fused INT8-QK+F16-PV kernel for dst=[%lld,%lld,%lld,%lld]\n",
+                (long long)dst->ne[0], (long long)dst->ne[1], (long long)dst->ne[2], (long long)dst->ne[3]);
+    }
+    ed_cuda_sage_attn_scratch_sizes sizes;
+    if (!ed_cuda_sage_attn_scratch_sizes_for(dst, &sizes)) {
+        return false;
+    }
+    ggml_cuda_pool_alloc<char> q_int8(ctx.pool(), sizes.q_int8_bytes);
+    ggml_cuda_pool_alloc<char> k_int8(ctx.pool(), sizes.k_int8_bytes);
+    ggml_cuda_pool_alloc<char> q_scale(ctx.pool(), sizes.q_scale_bytes);
+    ggml_cuda_pool_alloc<char> k_scale(ctx.pool(), sizes.k_scale_bytes);
+    ggml_cuda_pool_alloc<char> km(ctx.pool(), sizes.km_bytes);
+    ggml_cuda_pool_alloc<char> v_f16(ctx.pool(), sizes.v_f16_bytes);
+    ggml_cuda_pool_alloc<char> o_half(ctx.pool(), sizes.o_half_bytes);
+    ggml_cuda_pool_alloc<char> qm(ctx.pool(), sizes.qm_bytes);
+    ggml_cuda_pool_alloc<char> qk_bias(ctx.pool(), sizes.qk_bias_bytes);
+    ggml_cuda_pool_alloc<char> v_fp8(ctx.pool(), sizes.v_fp8_bytes);
+    ggml_cuda_pool_alloc<char> v_scale(ctx.pool(), sizes.v_scale_bytes);
+    ggml_cuda_pool_alloc<char> uniform_flag(ctx.pool(), sizes.uniform_flag_bytes);
+    ggml_cuda_pool_alloc<char> head_entropy(ctx.pool(), sizes.head_entropy_bytes);
+    ggml_cuda_pool_alloc<char> detect_acc(ctx.pool(), sizes.detect_acc_bytes);
+
+    ed_cuda_sage_attn_scratch scratch;
+    scratch.q_int8  = q_int8.get();
+    scratch.k_int8  = k_int8.get();
+    scratch.q_scale = q_scale.get();
+    scratch.k_scale = k_scale.get();
+    scratch.km      = km.get();
+    scratch.v_f16   = v_f16.get();
+    scratch.o_half  = o_half.get();
+    scratch.qm      = qm.get();
+    scratch.qk_bias = qk_bias.get();
+    scratch.v_fp8   = v_fp8.get();
+    scratch.v_scale = v_scale.get();
+    scratch.uniform_flag = uniform_flag.get();
+    scratch.head_entropy = head_entropy.get();
+    scratch.detect_acc   = detect_acc.get();
+
+    return ed_cuda_sage_attn_custom_compute(dst, &scratch, (void *) ctx.stream());
+}
+#endif // ED_ENABLE_CUDA_SAGE_ATTN
+
 static void ggml_cuda_flux_sp_gelu_bf16_compute(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_flux_sp_gelu_bf16_supported(dst));
 
@@ -5588,6 +5642,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 break;
             }
 #endif
+#ifdef ED_ENABLE_CUDA_SAGE_ATTN
+            if (ed_cuda_sage_attn_dispatch(ctx, dst)) {
+                break;
+            }
+#endif
 #ifdef ED_ENABLE_CUDA_ROPE
             if (ed_cuda_flux_sp_all_to_all_custom_compute(dst, (ed_cuda_sp_flux_stream_t) ctx.stream()) ||
                 ed_cuda_flux_sp_all_gather_custom_compute(dst, (ed_cuda_sp_flux_stream_t) ctx.stream()) ||
@@ -8239,6 +8298,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #endif
 #ifdef ED_ENABLE_CUDA_MODULATION
             if (ed_cuda_fused_modulate_custom_supported(op)) {
+                return true;
+            }
+#endif
+#ifdef ED_ENABLE_CUDA_SAGE_ATTN
+            if (ed_cuda_sage_attn_custom_supported(op)) {
                 return true;
             }
 #endif
