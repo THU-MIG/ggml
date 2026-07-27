@@ -14,6 +14,7 @@ static constexpr uint32_t ED_CHANNEL_RMS_NORM_CUSTOM_MAGIC = 0x4543524eU;
 static constexpr uint32_t ED_RMS_NORM_MUL_F16_CUSTOM_MAGIC = 0x45524d48U;
 static constexpr uint32_t ED_FUSED_MODULATE_CUSTOM_MAGIC = 0x45464d4fU;
 static constexpr uint32_t ED_FUSED_RESIDUAL_GATE_CUSTOM_MAGIC = 0x45465247U;
+static constexpr uint32_t ED_FUSED_WHERE_SELECT_CUSTOM_MAGIC = 0x45465753U;
 static constexpr uint32_t ED_ROPE_CUSTOM_MAGIC = 0x45525250U;
 static constexpr uint32_t ED_ATTENTION_V_PREP_CUSTOM_MAGIC = 0x45565050U;
 static constexpr uint32_t ED_ATTENTION_PAIR_PACK_CUSTOM_MAGIC = 0x45505150U;
@@ -287,6 +288,7 @@ static bool ggml_cuda_qwen_fused_qkv_pack_userdata_is_packed(uintptr_t userdata)
            low == ED_RMS_NORM_MUL_F16_CUSTOM_MAGIC ||
            low == ED_FUSED_MODULATE_CUSTOM_MAGIC ||
            low == ED_FUSED_RESIDUAL_GATE_CUSTOM_MAGIC ||
+           low == ED_FUSED_WHERE_SELECT_CUSTOM_MAGIC ||
            low == ED_ROPE_CUSTOM_MAGIC ||
            low == ED_ATTENTION_V_PREP_CUSTOM_MAGIC ||
            low == ED_ATTENTION_PAIR_PACK_CUSTOM_MAGIC ||
