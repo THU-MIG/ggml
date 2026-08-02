@@ -1,5 +1,7 @@
 #include "concat.cuh"
+#include <cstdint>
 #include <cstdlib>
+#include <type_traits>
 
 static bool ggml_cuda_concat_vec4_disabled() {
     static const bool disabled = []() {
@@ -10,17 +12,17 @@ static bool ggml_cuda_concat_vec4_disabled() {
 }
 
 // contiguous kernels
-template <int dim>
-static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_f32_cont_4d(const float * x,
-                                                                                    const float * y,
-                                                                                    float *       dst,
-                                                                                    int64_t       ne00,
-                                                                                    int64_t       ne01,
-                                                                                    int64_t       ne02,
-                                                                                    int64_t       ne0,
-                                                                                    int64_t       ne1,
-                                                                                    int64_t       ne2,
-                                                                                    int64_t       ne3) {
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont_4d(const T * x,
+                                                                                const T * y,
+                                                                                T *       dst,
+                                                                                int64_t   ne00,
+                                                                                int64_t   ne01,
+                                                                                int64_t   ne02,
+                                                                                int64_t   ne0,
+                                                                                int64_t   ne1,
+                                                                                int64_t   ne2,
+                                                                                int64_t   ne3) {
     static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
 
     const int64_t dst_block = ne0 * ne1 * ne2;
@@ -128,58 +130,61 @@ static bool concat_f32_vec4_supported(int64_t ne00, int64_t ne0) {
     return (ne00 % 4) == 0 && (ne0 % 4) == 0;
 }
 
-static void concat_f32_cuda_4d(const float * x,
-                               const float * y,
-                               float *       dst,
-                               int64_t       ne00,
-                               int64_t       ne01,
-                               int64_t       ne02,
-                               int64_t       ne0,
-                               int64_t       ne1,
-                               int64_t       ne2,
-                               int64_t       ne3,
-                               int           dim,
-                               cudaStream_t  stream) {
+template <typename T>
+static void concat_cuda_4d(const T *   x,
+                           const T *   y,
+                           T *         dst,
+                           int64_t     ne00,
+                           int64_t     ne01,
+                           int64_t     ne02,
+                           int64_t     ne0,
+                           int64_t     ne1,
+                           int64_t     ne2,
+                           int64_t     ne3,
+                           int         dim,
+                           cudaStream_t stream) {
     const int64_t n          = ne0 * ne1 * ne2 * ne3;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
-    if (!ggml_cuda_concat_vec4_disabled() &&
-        concat_f32_vec4_supported(ne00, ne0) &&
-        concat_f32_vec4_aligned(x, y, dst)) {
-        const int64_t n_v          = n / 4;
-        const int     num_blocks_v = (n_v + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
-        if (dim == 0) {
-            concat_f32_cont_4d_vec4<0><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+    if constexpr (std::is_same_v<T, float>) {
+        if (!ggml_cuda_concat_vec4_disabled() &&
+            concat_f32_vec4_supported(ne00, ne0) &&
+            concat_f32_vec4_aligned(x, y, dst)) {
+            const int64_t n_v          = n / 4;
+            const int     num_blocks_v = (n_v + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+            if (dim == 0) {
+                concat_f32_cont_4d_vec4<0><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                    (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
+                return;
+            }
+            if (dim == 1) {
+                concat_f32_cont_4d_vec4<1><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                    (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
+                return;
+            }
+            concat_f32_cont_4d_vec4<2><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
             return;
         }
-        if (dim == 1) {
-            concat_f32_cont_4d_vec4<1><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
-                (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
-            return;
-        }
-        concat_f32_cont_4d_vec4<2><<<num_blocks_v, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
-            (const float4 *) x, (const float4 *) y, (float4 *) dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
-        return;
     }
 
     if (dim == 0) {
-        concat_f32_cont_4d<0>
+        concat_cont_4d<T, 0>
             <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
         return;
     }
     if (dim == 1) {
-        concat_f32_cont_4d<1>
+        concat_cont_4d<T, 1>
             <<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
         return;
     }
-    concat_f32_cont_4d<2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
+    concat_cont_4d<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2, ne3);
 }
 
 // non-contiguous kernel (slow)
-template <int dim>
+template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
-    concat_f32_non_cont(
+    concat_non_cont(
         const char * src0,
         const char * src1,
               char * dst,
@@ -213,31 +218,31 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     const int64_t i2 = blockIdx.y;
     const int64_t i1 = blockIdx.x;
 
-    const float * x;
+    const T * x;
 
     for (int64_t i0 = threadIdx.x; i0 < ne0; i0 += blockDim.x) {
         if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-            x = (const float *)(src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00);
+            x = (const T *)(src0 + (i3       )*nb03 + (i2       )*nb02 + (i1       )*nb01 + (i0       )*nb00);
         } else {
             if constexpr (dim == 0) {
-                x = (const float *) (src1 + i3 * nb13 + i2 * nb12 + i1 * nb11 + (i0 - ne00) * nb10);
+                x = (const T *) (src1 + i3 * nb13 + i2 * nb12 + i1 * nb11 + (i0 - ne00) * nb10);
             } else if constexpr (dim == 1) {
-                x = (const float *) (src1 + i3 * nb13 + i2 * nb12 + (i1 - ne01) * nb11 + i0 * nb10);
+                x = (const T *) (src1 + i3 * nb13 + i2 * nb12 + (i1 - ne01) * nb11 + i0 * nb10);
             } else if constexpr (dim == 2) {
-                x = (const float *) (src1 + i3 * nb13 + (i2 - ne02) * nb12 + i1 * nb11 + i0 * nb10);
+                x = (const T *) (src1 + i3 * nb13 + (i2 - ne02) * nb12 + i1 * nb11 + i0 * nb10);
             } else if constexpr (dim == 3) {
-                x = (const float *) (src1 + (i3 - ne03) * nb13 + i2 * nb12 + i1 * nb11 + i0 * nb10);
+                x = (const T *) (src1 + (i3 - ne03) * nb13 + i2 * nb12 + i1 * nb11 + i0 * nb10);
             }
         }
 
-        float * y = (float *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
+        T * y = (T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
 
         *y = *x;
     }
 }
 
-
-void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <typename T>
+static void ggml_cuda_op_concat_typed(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
@@ -245,32 +250,28 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const int32_t dim = ((int32_t *) dst->op_params)[0];
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
-
     if (ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
-        const float * src0_d = (const float *)src0->data;
-        const float * src1_d = (const float *)src1->data;
+        const T * src0_d = (const T *) src0->data;
+        const T * src1_d = (const T *) src1->data;
 
-        float * dst_d = (float *)dst->data;
+        T * dst_d = (T *) dst->data;
 
         if (dim != 3) {
-            concat_f32_cuda_4d(src0_d, src1_d, dst_d,
-                               src0->ne[0], src0->ne[1], src0->ne[2],
-                               dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
-                               dim, stream);
+            concat_cuda_4d(src0_d, src1_d, dst_d,
+                           src0->ne[0], src0->ne[1], src0->ne[2],
+                           dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                           dim, stream);
         } else {
             const size_t size0 = ggml_nbytes(src0);
             const size_t size1 = ggml_nbytes(src1);
 
-            CUDA_CHECK(cudaMemcpyAsync(dst_d,           src0_d, size0, cudaMemcpyDeviceToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(dst_d + size0/4, src1_d, size1, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(dst->data, (const void *) src0_d, size0, cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, (const void *) src1_d, size1, cudaMemcpyDeviceToDevice, stream));
         }
     } else {
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
-            concat_f32_non_cont<dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
                 (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
                 src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
                 src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
@@ -296,5 +297,28 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 GGML_ABORT("Invalid dim: %d", dim);
                 break;
         }
+    }
+}
+
+void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(src0->type == src1->type);
+    GGML_ASSERT(dst->type  == src0->type);
+
+    switch (dst->type) {
+        case GGML_TYPE_F32:
+            ggml_cuda_op_concat_typed<float>(ctx, dst);
+            break;
+        case GGML_TYPE_F16:
+            ggml_cuda_op_concat_typed<ggml_half>(ctx, dst);
+            break;
+        case GGML_TYPE_BF16:
+            ggml_cuda_op_concat_typed<nv_bfloat16>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("Unsupported concat type: %d", dst->type);
+            break;
     }
 }
