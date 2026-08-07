@@ -2460,10 +2460,12 @@ static bool ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(const ggml_tensor * src0,
         ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_DISABLE_LONG_FC2")) {
         return false;
     }
+    const bool enable_mid_seq_fc2 = ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2");
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
            src0 != nullptr && src1 != nullptr && dst != nullptr &&
            src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-           src1->ne[1] >= 16000 && dst->ne[0] == 5376 && (src0->ne[0] == 14336 || src0->ne[0] == 7168);
+           dst->ne[0] == 5376 && (src0->ne[0] == 14336 || src0->ne[0] == 7168) &&
+           (src1->ne[1] >= 16000 || (enable_mid_seq_fc2 && src1->ne[1] == 7919));
 }
 
 static bool ggml_cuda_mul_mat_fused_gelu(const ggml_tensor * dst) {

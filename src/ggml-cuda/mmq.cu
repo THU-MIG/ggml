@@ -315,11 +315,13 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 #if !defined(GGML_CUDA_FORCE_MMQ)
         const bool sm90_q4k_cublas_enabled = ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS");
         const bool h3_mid_seq_shape = ne11 == 7919 && k == 5376 && (m == 28672 || m == 21504);
+        const bool h3_mid_fc2_shape = ne11 == 7919 && m == 5376 && (k == 14336 || k == 7168);
         const bool h3_long_qkv_shape = ne11 >= 16000 && m == 21504 && k == 5376;
         const bool h3_long_fc1_shape = ne11 >= 16000 && m == 28672 && k == 5376;
         const bool h3_long_fc2_shape = ne11 >= 16000 && m == 5376 && (k == 14336 || k == 7168);
         if (sm90_q4k_cublas_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 && type == GGML_TYPE_Q4_K &&
             (h3_mid_seq_shape ||
+             (ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2") && h3_mid_fc2_shape) ||
              h3_long_qkv_shape ||
              h3_long_fc1_shape ||
              (!ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_DISABLE_LONG_FC2") && h3_long_fc2_shape))) {
