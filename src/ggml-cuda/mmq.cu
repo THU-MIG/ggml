@@ -3,6 +3,13 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <cstdlib>
+
+static bool ggml_cuda_env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -264,7 +271,7 @@ void ggml_cuda_op_mul_mat_q(
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size, fused_bias);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, int64_t m, int64_t k) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
@@ -305,6 +312,20 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     }
 
     if (turing_mma_available(cc)) {
+#if !defined(GGML_CUDA_FORCE_MMQ)
+        const bool sm90_q4k_cublas_enabled = ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS");
+        const bool h3_mid_seq_shape = ne11 == 7919 && k == 5376 && (m == 28672 || m == 21504);
+        const bool h3_long_qkv_shape = ne11 >= 16000 && m == 21504 && k == 5376;
+        const bool h3_long_fc1_shape = ne11 >= 16000 && m == 28672 && k == 5376;
+        const bool h3_long_fc2_shape = ne11 >= 16000 && m == 5376 && (k == 14336 || k == 7168);
+        if (sm90_q4k_cublas_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 && type == GGML_TYPE_Q4_K &&
+            (h3_mid_seq_shape ||
+             h3_long_qkv_shape ||
+             h3_long_fc1_shape ||
+             (!ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_DISABLE_LONG_FC2") && h3_long_fc2_shape))) {
+            return false;
+        }
+#endif
         return true;
     }
 

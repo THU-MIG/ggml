@@ -2450,6 +2450,22 @@ static int32_t ggml_cuda_mul_mat_effective_prec(const ggml_tensor * dst) {
     return dst != nullptr ? dst->op_params[0] : GGML_PREC_DEFAULT;
 }
 
+static bool ggml_cuda_env_flag_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    if (!ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS") ||
+        ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_DISABLE_LONG_FC2")) {
+        return false;
+    }
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
+           src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src1->ne[1] >= 16000 && dst->ne[0] == 5376 && (src0->ne[0] == 14336 || src0->ne[0] == 7168);
+}
+
 static bool ggml_cuda_mul_mat_fused_gelu(const ggml_tensor * dst) {
     return dst != nullptr &&
            dst->op == GGML_OP_UNARY &&
@@ -4182,7 +4198,11 @@ static void ggml_cuda_op_mul_mat_cublas(
     const bool supports_bf16 = GGML_CUDA_CC_IS_NVIDIA(cc) || GGML_CUDA_CC_IS_AMD(cc) ||
         (GGML_CUDA_CC_IS_MTHREADS(cc) && cc >= GGML_CUDA_CC_QY2);
 
-    const int32_t effective_prec = ggml_cuda_mul_mat_effective_prec(dst);
+    int32_t effective_prec = ggml_cuda_mul_mat_effective_prec(dst);
+    const bool h3_sm90_q4k_fc2_f32_cublas = ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(src0, src1, dst, cc);
+    if (h3_sm90_q4k_fc2_f32_cublas) {
+        effective_prec = GGML_PREC_F32;
+    }
     const bool fused_gelu = ggml_cuda_mul_mat_fused_gelu(dst);
 
     const bool use_fp16 =
@@ -4315,7 +4335,8 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
 
-        if (!force_compute_type.fp16 && (GGML_CUDA_CC_IS_CDNA(cc)
+        if (!force_compute_type.fp16 && (h3_sm90_q4k_fc2_f32_cublas
+                                        || GGML_CUDA_CC_IS_CDNA(cc)
                                         || GGML_CUDA_CC_IS_RDNA4(cc)
                                         || cc == GGML_CUDA_CC_VOLTA
                                         || force_compute_type.fp32))
@@ -5292,7 +5313,7 @@ static void ggml_cuda_mul_mat(
 
             const int cc            = ggml_cuda_info().devices[id].cc;
             const int warp_size     = ggml_cuda_info().devices[id].warp_size;
-            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -5300,7 +5321,7 @@ static void ggml_cuda_mul_mat(
     } else {
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
-        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -5379,7 +5400,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02, dst->ne[0], src0->ne[0])) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -5528,7 +5549,7 @@ static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst
                     return "mul_mat_id_vec_f";
                 }
             }
-            if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+            if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2], dst->ne[0], src0->ne[0])) {
                 return "mul_mat_id_mmq";
             }
             if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
@@ -5563,7 +5584,7 @@ static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst
             }
             const int cc        = ggml_cuda_info().devices[id].cc;
             const int warp_size = ggml_cuda_info().devices[id].warp_size;
-            use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+            use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
             use_mul_mat_f           = use_mul_mat_f       && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f   && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_hardware_available(cc);
@@ -5571,7 +5592,7 @@ static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst
     } else {
         const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-        use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+        use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
         use_mul_mat_f           = use_mul_mat_f       && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f   && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_hardware_available(cc);
