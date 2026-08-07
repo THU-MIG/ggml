@@ -74,6 +74,9 @@
 #ifdef ED_ENABLE_CUDNN_CONV3D
 #include "ed_cudnn_conv3d.h"
 #endif
+#ifdef ED_ENABLE_CUDNN_CONV_TRANSPOSE_1D
+#include "ed_cudnn_conv_transpose_1d.h"
+#endif
 #ifdef ED_ENABLE_CUDNN_SDPA
 #include "ed_cudnn_sdpa.h"
 #endif
@@ -6028,6 +6031,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_conv_2d_transpose_p0(ctx, dst);
             break;
         case GGML_OP_CONV_TRANSPOSE_1D:
+#ifdef ED_ENABLE_CUDNN_CONV_TRANSPOSE_1D
+            if (ed_cudnn_conv_transpose_1d_compute(dst, (ed_cudnn_conv_transpose_1d_stream_t) ctx.stream()) ==
+                ED_CUDNN_CONV_TRANSPOSE_1D_SUCCESS) {
+                break;
+            }
+#endif
             ggml_cuda_op_conv_transpose_1d(ctx,dst);
             break;
         case GGML_OP_POOL_2D:
