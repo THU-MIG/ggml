@@ -6334,6 +6334,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ed_cuda_flux_sp_qkv_combined_pair_recv_prep_custom_compute(dst, (ed_cuda_sp_flux_stream_t) ctx.stream()) ||
                 ed_cuda_flux_sp_qkv_pair_recv_prep_custom_compute(dst, (ed_cuda_sp_flux_stream_t) ctx.stream()) ||
                 ed_cuda_flux_sp_qkv_recv_prep_custom_compute(dst, (ed_cuda_sp_flux_stream_t) ctx.stream()) ||
+                ed_cuda_attention_qkv_split_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
                 ed_cuda_attention_qkv_pair_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
                 ed_cuda_attention_pair_pack_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
                 ed_cuda_attention_v_prep_custom_compute(dst, (ed_cuda_attention_v_prep_stream_t) ctx.stream()) ||
@@ -9003,6 +9004,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    ed_cuda_flux_sp_qkv_combined_pair_recv_prep_custom_supported(op) ||
                    ed_cuda_flux_sp_qkv_pair_recv_prep_custom_supported(op) ||
                    ed_cuda_flux_sp_qkv_recv_prep_custom_supported(op) ||
+                   ed_cuda_attention_qkv_split_pack_custom_supported(op) ||
                    ed_cuda_attention_qkv_pair_pack_custom_supported(op) ||
                    ed_cuda_attention_pair_pack_custom_supported(op) ||
                    ed_cuda_attention_v_prep_custom_supported(op) ||
