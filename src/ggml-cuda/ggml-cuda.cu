@@ -103,6 +103,7 @@
 #include <atomic>
 #include <charconv>
 #include <cinttypes>
+#include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -114,7 +115,9 @@
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
+#include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -2458,17 +2461,73 @@ static bool ggml_cuda_env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool ggml_cuda_env_step_list_contains(const char * name, const int step) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    const char * cursor = value;
+    while (*cursor != '\0') {
+        char * end = nullptr;
+        const long parsed = std::strtol(cursor, &end, 10);
+        if (end != cursor && parsed == step) {
+            return true;
+        }
+        cursor = end != cursor ? end : cursor + 1;
+        while (*cursor == ',' || *cursor == ';' || *cursor == ' ') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_h3_current_step_enabled(const char * env_name) {
+    if (ggml_cuda_env_flag_enabled(env_name)) {
+        return true;
+    }
+    const char * current_step = getenv("ED_MINIMAX_H3_CURRENT_STEP");
+    if (current_step == nullptr || current_step[0] == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    const long step = std::strtol(current_step, &end, 10);
+    if (end == current_step || step < 0 || step > INT_MAX) {
+        return false;
+    }
+    const std::string list_name = std::string(env_name) + "_STEPS";
+    return ggml_cuda_env_step_list_contains(list_name.c_str(), static_cast<int>(step));
+}
+
 static bool ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
     if (!ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS") ||
         ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_DISABLE_LONG_FC2")) {
         return false;
     }
-    const bool enable_mid_seq_fc2 = ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2");
+    const bool enable_mid_seq_fc2 = ggml_cuda_h3_current_step_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2");
+    const bool enable_mid_seq_fc2_range = ggml_cuda_h3_current_step_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2_RANGE");
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
            src0 != nullptr && src1 != nullptr && dst != nullptr &&
            src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            dst->ne[0] == 5376 && (src0->ne[0] == 14336 || src0->ne[0] == 7168) &&
-           (src1->ne[1] >= 16000 || (enable_mid_seq_fc2 && src1->ne[1] == 7919));
+           (src1->ne[1] >= 16000 ||
+            (enable_mid_seq_fc2 && src1->ne[1] == 7919) ||
+            (enable_mid_seq_fc2_range && src1->ne[1] >= 7800 && src1->ne[1] <= 8200));
+}
+
+static bool ggml_cuda_h3_sm90_q4k_qkv_f32_output(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    return ggml_cuda_env_flag_enabled("ED_MINIMAX_H3_QKV_F32_OUTPUT") &&
+           GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
+           src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src0->ne[0] == 5376 && dst->ne[0] == 21504 && src1->ne[1] >= 16000;
+}
+
+static bool ggml_cuda_h3_sm90_q4k_fc1_f32_output(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    return ggml_cuda_env_flag_enabled("ED_MINIMAX_H3_FC1_F32_OUTPUT") &&
+           GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
+           src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+           src0->ne[0] == 5376 && dst->ne[0] == 28672 && src1->ne[1] >= 16000;
 }
 
 static bool ggml_cuda_mul_mat_fused_gelu(const ggml_tensor * dst) {
@@ -4175,6 +4234,273 @@ static void ggml_cuda_mul_mat_internal_profile_stop(
     ggml_cuda_mul_mat_internal_profile_record(branch, stage, src0, src1, dst, row_diff, src1_ncols, ne10, elapsed_ms);
 }
 
+struct ggml_cuda_h3_cublas_compare_partial {
+    float max_abs;
+    double sum_abs;
+    double sum_sq;
+    double sum_ref_sq;
+    double sum_test_sq;
+    double sum_dot;
+};
+
+static __global__ void ggml_cuda_h3_fake_q8_1_to_f16_kernel(const float * src, half * dst, int64_t n) {
+    const int lane = threadIdx.x & 31;
+    const int64_t warp = ((int64_t) blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int64_t index = warp * 32 + lane;
+    if (index >= n) {
+        return;
+    }
+
+    const float value = src[index];
+    float amax = fabsf(value);
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset));
+    }
+    if (amax == 0.0f) {
+        dst[index] = __float2half(0.0f);
+        return;
+    }
+    const float d = amax / 127.0f;
+    const int q = (int) roundf(value / d);
+    const half d_half = __float2half(d);
+    dst[index] = __float2half((float) q * __half2float(d_half));
+}
+
+static bool ggml_cuda_h3_fake_q8_1_enabled_for(const ggml_tensor * dst, int64_t row_diff, int64_t src1_ncols, int64_t ne10) {
+    if (!ggml_cuda_env_flag_enabled("ED_H3_CUBLAS_FAKE_Q8_1") || dst == nullptr ||
+        src1_ncols < 7800 || src1_ncols > 8200 || ne10 != 5376 ||
+        (row_diff != 21504 && row_diff != 28672)) {
+        return false;
+    }
+    const char * name_filter = getenv("ED_H3_CUBLAS_FAKE_Q8_1_NAME");
+    if (name_filter != nullptr && name_filter[0] != '\0' && std::strstr(dst->name, name_filter) == nullptr) {
+        return false;
+    }
+    const char * step_filter = getenv("ED_H3_CUBLAS_FAKE_Q8_1_STEPS");
+    if (step_filter != nullptr && step_filter[0] != '\0') {
+        const char * current_step = getenv("ED_MINIMAX_H3_CURRENT_STEP");
+        if (current_step == nullptr || current_step[0] == '\0') {
+            return false;
+        }
+        char * end = nullptr;
+        const long step = std::strtol(current_step, &end, 10);
+        if (end == current_step || step < 0 || step > INT_MAX ||
+            !ggml_cuda_env_step_list_contains("ED_H3_CUBLAS_FAKE_Q8_1_STEPS", (int) step)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static __global__ void ggml_cuda_h3_cublas_compare_kernel(
+        const float * ref,
+        const float * test,
+        ggml_cuda_h3_cublas_compare_partial * partials,
+        int64_t n) {
+    const int tid = threadIdx.x;
+    const int64_t stride = (int64_t) blockDim.x * gridDim.x;
+    int64_t i = (int64_t) blockIdx.x * blockDim.x + tid;
+
+    float max_abs = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    double sum_ref_sq = 0.0;
+    double sum_test_sq = 0.0;
+    double sum_dot = 0.0;
+    for (; i < n; i += stride) {
+        const float ref_v = ref[i];
+        const float test_v = test[i];
+        const float diff = test_v - ref_v;
+        const float abs_diff = fabsf(diff);
+        max_abs = fmaxf(max_abs, abs_diff);
+        sum_abs += (double) abs_diff;
+        sum_sq += (double) diff * diff;
+        sum_ref_sq += (double) ref_v * ref_v;
+        sum_test_sq += (double) test_v * test_v;
+        sum_dot += (double) ref_v * test_v;
+    }
+
+    __shared__ float s_max_abs[256];
+    __shared__ double s_sum_abs[256];
+    __shared__ double s_sum_sq[256];
+    __shared__ double s_sum_ref_sq[256];
+    __shared__ double s_sum_test_sq[256];
+    __shared__ double s_sum_dot[256];
+    s_max_abs[tid] = max_abs;
+    s_sum_abs[tid] = sum_abs;
+    s_sum_sq[tid] = sum_sq;
+    s_sum_ref_sq[tid] = sum_ref_sq;
+    s_sum_test_sq[tid] = sum_test_sq;
+    s_sum_dot[tid] = sum_dot;
+    __syncthreads();
+
+    for (int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            s_max_abs[tid] = fmaxf(s_max_abs[tid], s_max_abs[tid + offset]);
+            s_sum_abs[tid] += s_sum_abs[tid + offset];
+            s_sum_sq[tid] += s_sum_sq[tid + offset];
+            s_sum_ref_sq[tid] += s_sum_ref_sq[tid + offset];
+            s_sum_test_sq[tid] += s_sum_test_sq[tid + offset];
+            s_sum_dot[tid] += s_sum_dot[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        partials[blockIdx.x] = {s_max_abs[0], s_sum_abs[0], s_sum_sq[0], s_sum_ref_sq[0], s_sum_test_sq[0], s_sum_dot[0]};
+    }
+}
+
+static bool ggml_cuda_h3_cublas_compare_enabled_for(const ggml_tensor * dst, int64_t row_diff, int64_t src1_ncols, int64_t ne10) {
+    if (!ggml_cuda_env_flag_enabled("ED_H3_CUBLAS_COMPARE_MMQ")) {
+        return false;
+    }
+    if (dst == nullptr) {
+        return false;
+    }
+    const char * name_filter = getenv("ED_H3_CUBLAS_COMPARE_NAME");
+    if (name_filter != nullptr && name_filter[0] != '\0' && std::strstr(dst->name, name_filter) == nullptr) {
+        return false;
+    }
+    const char * step_filter = getenv("ED_H3_CUBLAS_COMPARE_STEPS");
+    if (step_filter != nullptr && step_filter[0] != '\0') {
+        const char * current_step = getenv("ED_MINIMAX_H3_CURRENT_STEP");
+        if (current_step == nullptr || current_step[0] == '\0') {
+            return false;
+        }
+        char * end = nullptr;
+        const long step = std::strtol(current_step, &end, 10);
+        if (end == current_step || step < 0 || step > INT_MAX ||
+            !ggml_cuda_env_step_list_contains("ED_H3_CUBLAS_COMPARE_STEPS", (int) step)) {
+            return false;
+        }
+    }
+    const char * shape_filter = getenv("ED_H3_CUBLAS_COMPARE_SHAPE");
+    if (shape_filter != nullptr && shape_filter[0] != '\0') {
+        const bool is_qkv = row_diff == 21504 && ne10 == 5376;
+        const bool is_fc1 = row_diff == 28672 && ne10 == 5376;
+        const bool is_fc2 = row_diff == 5376 && (ne10 == 14336 || ne10 == 7168);
+        if ((strcmp(shape_filter, "qkv") == 0 && !is_qkv) ||
+            (strcmp(shape_filter, "fc1") == 0 && !is_fc1) ||
+            (strcmp(shape_filter, "fc2") == 0 && !is_fc2)) {
+            return false;
+        }
+    }
+    const char * max_calls_env = getenv("ED_H3_CUBLAS_COMPARE_MAX_CALLS");
+    static int compared_calls = 0;
+    const int max_calls = max_calls_env != nullptr && max_calls_env[0] != '\0' ? std::atoi(max_calls_env) : 8;
+    if (max_calls >= 0 && compared_calls >= max_calls) {
+        return false;
+    }
+    ++compared_calls;
+    GGML_UNUSED(src1_ncols);
+    return true;
+}
+
+static void ggml_cuda_h3_cublas_compare_log(
+        ggml_backend_cuda_context & ctx,
+        int id,
+        cudaStream_t stream,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const float * cublas_out,
+        const float * mmq_out,
+        int64_t row_diff,
+        int64_t src1_ncols,
+        int64_t ne10);
+
+static void ggml_cuda_h3_cublas_compare_mmq(
+        ggml_backend_cuda_context & ctx,
+        int id,
+        cudaStream_t stream,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        ggml_tensor * dst,
+        const float * cublas_out,
+        int64_t row_low,
+        int64_t row_diff,
+        int64_t src1_ncols,
+        int64_t ne10,
+        const ggml_tensor * fused_bias) {
+    if (!ggml_cuda_h3_cublas_compare_enabled_for(dst, row_diff, src1_ncols, ne10)) {
+        return;
+    }
+    if (row_low != 0 || row_diff != dst->ne[0] || src1_ncols != dst->ne[1] ||
+        dst->ne[2] != 1 || dst->ne[3] != 1 || fused_bias != nullptr ||
+        src0->type != GGML_TYPE_Q4_K || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+        if (ggml_cuda_env_flag_enabled("ED_H3_CUBLAS_COMPARE_DEBUG")) {
+            GGML_LOG_INFO("ED_H3_CUBLAS_COMPARE_SKIP name=%s row_low=%" PRId64 " row_diff=%" PRId64 " src1_ncols=%" PRId64
+                          " dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] fused_bias=%d src0_type=%s src1_type=%s dst_type=%s contig=%d,%d,%d\n",
+                          dst != nullptr ? dst->name : "", row_low, row_diff, src1_ncols,
+                          dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3], fused_bias != nullptr,
+                          ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
+                          ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_contiguous(dst));
+        }
+        return;
+    }
+
+    const int64_t n = row_diff * src1_ncols;
+    ggml_cuda_pool_alloc<float> mmq_out(ctx.pool(id), n);
+    ggml_tensor mmq_dst = *dst;
+    mmq_dst.data = mmq_out.get();
+    ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, &mmq_dst);
+    ggml_cuda_h3_cublas_compare_log(ctx, id, stream, src0, src1, dst, cublas_out, mmq_out.get(), row_diff, src1_ncols, ne10);
+}
+
+static void ggml_cuda_h3_cublas_compare_log(
+        ggml_backend_cuda_context & ctx,
+        int id,
+        cudaStream_t stream,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * dst,
+        const float * cublas_out,
+        const float * mmq_out,
+        int64_t row_diff,
+        int64_t src1_ncols,
+        int64_t ne10) {
+    const int64_t n = row_diff * src1_ncols;
+    if (n <= 0) {
+        return;
+    }
+    constexpr int block_size = 256;
+    const int blocks = (int) std::min<int64_t>(1024, (n + block_size - 1) / block_size);
+    ggml_cuda_pool_alloc<ggml_cuda_h3_cublas_compare_partial> partials_dev(ctx.pool(id), blocks);
+    ggml_cuda_h3_cublas_compare_kernel<<<blocks, block_size, 0, stream>>>(mmq_out, cublas_out, partials_dev.get(), n);
+    CUDA_CHECK(cudaGetLastError());
+    std::vector<ggml_cuda_h3_cublas_compare_partial> partials((size_t) blocks);
+    CUDA_CHECK(cudaMemcpyAsync(partials.data(), partials_dev.get(), partials.size() * sizeof(partials[0]), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    float max_abs = 0.0f;
+    double sum_abs = 0.0;
+    double sum_sq = 0.0;
+    double sum_ref_sq = 0.0;
+    double sum_test_sq = 0.0;
+    double sum_dot = 0.0;
+    for (const auto & partial : partials) {
+        max_abs = std::max(max_abs, partial.max_abs);
+        sum_abs += partial.sum_abs;
+        sum_sq += partial.sum_sq;
+        sum_ref_sq += partial.sum_ref_sq;
+        sum_test_sq += partial.sum_test_sq;
+        sum_dot += partial.sum_dot;
+    }
+    const double mean_abs = sum_abs / (double) n;
+    const double rmse = std::sqrt(sum_sq / (double) n);
+    const double denom = std::sqrt(sum_ref_sq) * std::sqrt(sum_test_sq);
+    const double cosine = denom > 0.0 ? sum_dot / denom : 0.0;
+    GGML_LOG_INFO("ED_H3_CUBLAS_COMPARE step=%s name=%s m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                  " max_abs=%.9g mean_abs=%.9g rmse=%.9g cosine=%.12g ref_l2=%.9g test_l2=%.9g src0_type=%s src1_type=%s\n",
+                  getenv("ED_MINIMAX_H3_CURRENT_STEP") != nullptr ? getenv("ED_MINIMAX_H3_CURRENT_STEP") : "-",
+                  dst != nullptr ? dst->name : "", row_diff, src1_ncols, ne10,
+                  max_abs, mean_abs, rmse, cosine, std::sqrt(sum_ref_sq), std::sqrt(sum_test_sq),
+                  ggml_type_name(src0->type), ggml_type_name(src1->type));
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
@@ -4205,6 +4531,8 @@ static void ggml_cuda_op_mul_mat_cublas(
 
     int32_t effective_prec = ggml_cuda_mul_mat_effective_prec(dst);
     const bool h3_sm90_q4k_fc2_f32_cublas = ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(src0, src1, dst, cc);
+    const bool h3_sm90_q4k_qkv_f32_output = ggml_cuda_h3_sm90_q4k_qkv_f32_output(src0, src1, dst, cc);
+    const bool h3_sm90_q4k_fc1_f32_output = ggml_cuda_h3_sm90_q4k_fc1_f32_output(src0, src1, dst, cc);
     if (h3_sm90_q4k_fc2_f32_cublas) {
         effective_prec = GGML_PREC_F32;
     }
@@ -4330,9 +4658,19 @@ static void ggml_cuda_op_mul_mat_cublas(
             size_t ne = src1_ncols*ne10;
             src1_as_f16.alloc(ne);
             cudaEvent_t profile_start = ggml_cuda_mul_mat_internal_profile_start(stream);
-            to_fp16_cuda(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            if (src1->type == GGML_TYPE_F32 && ggml_cuda_h3_fake_q8_1_enabled_for(dst, row_diff, src1_ncols, ne10)) {
+                constexpr int block_size = 256;
+                const int64_t warps = (ne + 31) / 32;
+                const int blocks = (int) ((warps * 32 + block_size - 1) / block_size);
+                ggml_cuda_h3_fake_q8_1_to_f16_kernel<<<blocks, block_size, 0, stream>>>(src1_ddf_i, src1_as_f16.get(), ne);
+                CUDA_CHECK(cudaGetLastError());
+            } else {
+                to_fp16_cuda(src1_ddf_i, src1_as_f16.get(), ne, stream);
+            }
             ggml_cuda_mul_mat_internal_profile_stop(
-                profile_start, stream, "fp16", "src1_to_f16", src0, src1, dst, row_diff, src1_ncols, ne10);
+                profile_start, stream, "fp16",
+                ggml_cuda_h3_fake_q8_1_enabled_for(dst, row_diff, src1_ncols, ne10) ? "src1_fake_q8_1_to_f16" : "src1_to_f16",
+                src0, src1, dst, row_diff, src1_ncols, ne10);
         }
         const half * src1_ptr = src1->type == GGML_TYPE_F16 ? (const half *) src1_ddf_i : src1_as_f16.get();
 
@@ -4341,6 +4679,8 @@ static void ggml_cuda_op_mul_mat_cublas(
         const auto & force_compute_type = ggml_cuda_cublas_get_force_compute_type();
 
         if (!force_compute_type.fp16 && (h3_sm90_q4k_fc2_f32_cublas
+                                        || h3_sm90_q4k_qkv_f32_output
+                                        || h3_sm90_q4k_fc1_f32_output
                                         || GGML_CUDA_CC_IS_CDNA(cc)
                                         || GGML_CUDA_CC_IS_RDNA4(cc)
                                         || cc == GGML_CUDA_CC_VOLTA
@@ -5318,7 +5658,7 @@ static void ggml_cuda_mul_mat(
 
             const int cc            = ggml_cuda_info().devices[id].cc;
             const int warp_size     = ggml_cuda_info().devices[id].warp_size;
-            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
+            use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0], dst->name);
             use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -5326,7 +5666,7 @@ static void ggml_cuda_mul_mat(
     } else {
         const int cc            = ggml_cuda_info().devices[ctx.device].cc;
         const int warp_size     = ggml_cuda_info().devices[ctx.device].warp_size;
-        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
+        use_mul_mat_q           = use_mul_mat_q             && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0], dst->name);
         use_mul_mat_f           = use_mul_mat_f             && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f         && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
@@ -5371,6 +5711,18 @@ static void ggml_cuda_mul_mat(
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_q, quantize_mmq_q8_1_cuda);
     } else {
         ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr, fused_bias);
+        ggml_cuda_h3_cublas_compare_mmq(ctx,
+                                        ctx.device,
+                                        ctx.stream(),
+                                        src0,
+                                        src1,
+                                        dst,
+                                        (const float *) dst->data,
+                                        0,
+                                        dst->ne[0],
+                                        dst->ne[1],
+                                        src1->ne[0],
+                                        fused_bias);
     }
 }
 
@@ -5405,7 +5757,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02, dst->ne[0], src0->ne[0])) {
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02, dst->ne[0], src0->ne[0], dst->name)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -5554,7 +5906,7 @@ static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst
                     return "mul_mat_id_vec_f";
                 }
             }
-            if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2], dst->ne[0], src0->ne[0])) {
+            if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2], dst->ne[0], src0->ne[0], dst->name)) {
                 return "mul_mat_id_mmq";
             }
             if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
@@ -5589,7 +5941,7 @@ static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst
             }
             const int cc        = ggml_cuda_info().devices[id].cc;
             const int warp_size = ggml_cuda_info().devices[id].warp_size;
-            use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
+            use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0], dst->name);
             use_mul_mat_f           = use_mul_mat_f       && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
             use_mul_mat_vec_f       = use_mul_mat_vec_f   && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
             any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_hardware_available(cc);
@@ -5597,7 +5949,7 @@ static const char * ggml_cuda_mul_mat_profile_infer_path(const ggml_tensor * dst
     } else {
         const int cc        = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-        use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0]);
+        use_mul_mat_q           = use_mul_mat_q       && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0, dst->ne[0], src0->ne[0], dst->name);
         use_mul_mat_f           = use_mul_mat_f       && ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id=*/false);
         use_mul_mat_vec_f       = use_mul_mat_vec_f   && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_hardware_available(cc);

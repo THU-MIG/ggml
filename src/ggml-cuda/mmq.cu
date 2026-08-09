@@ -4,10 +4,129 @@
 #include "mmid.cuh"
 
 #include <cstdlib>
+#include <cstring>
+#include <inttypes.h>
 
 static bool ggml_cuda_env_flag_enabled(const char * name) {
     const char * value = std::getenv(name);
     return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool ggml_cuda_env_step_list_contains(const char * name, const int step) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    const char * cursor = value;
+    while (*cursor != '\0') {
+        char * end = nullptr;
+        long parsed = std::strtol(cursor, &end, 10);
+        if (end != cursor && parsed == step) {
+            return true;
+        }
+        cursor = end != cursor ? end : cursor + 1;
+        while (*cursor == ',' || *cursor == ';' || *cursor == ' ') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_env_list_present(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0';
+}
+
+static int ggml_cuda_h3_layer_from_name(const char * name) {
+    if (name == nullptr || name[0] == '\0') {
+        return -1;
+    }
+    const char * blocks = std::strstr(name, "blocks.");
+    if (blocks == nullptr) {
+        return -1;
+    }
+    const char * cursor = blocks + 7;
+    char * end = nullptr;
+    const long layer = std::strtol(cursor, &end, 10);
+    if (end == cursor || layer < 0 || layer > INT_MAX) {
+        return -1;
+    }
+    return static_cast<int>(layer);
+}
+
+static bool ggml_cuda_h3_scoped_enabled(const char * env_name, const char * dst_name) {
+    if (ggml_cuda_env_flag_enabled(env_name)) {
+        return true;
+    }
+
+    const std::string step_list_name = std::string(env_name) + "_STEPS";
+    const std::string layer_list_name = std::string(env_name) + "_LAYERS";
+    const bool has_step_scope = ggml_cuda_env_list_present(step_list_name.c_str());
+    const bool has_layer_scope = ggml_cuda_env_list_present(layer_list_name.c_str());
+    if (!has_step_scope && !has_layer_scope) {
+        return false;
+    }
+
+    if (has_step_scope) {
+        const char * current_step = std::getenv("ED_MINIMAX_H3_CURRENT_STEP");
+        if (current_step == nullptr || current_step[0] == '\0') {
+            return false;
+        }
+        char * end = nullptr;
+        const long step = std::strtol(current_step, &end, 10);
+        if (end == current_step || step < 0 || step > INT_MAX ||
+            !ggml_cuda_env_step_list_contains(step_list_name.c_str(), static_cast<int>(step))) {
+            return false;
+        }
+    }
+
+    if (has_layer_scope) {
+        const int layer = ggml_cuda_h3_layer_from_name(dst_name);
+        if (layer < 0 || !ggml_cuda_env_step_list_contains(layer_list_name.c_str(), layer)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_mmq_phase_profile_enabled() {
+    static const bool enabled = ggml_cuda_env_flag_enabled("ED_PROFILE_MMQ_PHASES");
+    return enabled;
+}
+
+static cudaEvent_t ggml_cuda_mmq_phase_profile_start(cudaStream_t stream) {
+    if (!ggml_cuda_mmq_phase_profile_enabled()) {
+        return nullptr;
+    }
+    cudaEvent_t event = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDefault));
+    CUDA_CHECK(cudaEventRecord(event, stream));
+    return event;
+}
+
+static void ggml_cuda_mmq_phase_profile_stop(cudaEvent_t start, cudaStream_t stream, const char * phase,
+                                             const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                                             int64_t m, int64_t n, int64_t k) {
+    if (start == nullptr) {
+        return;
+    }
+    cudaEvent_t stop = nullptr;
+    CUDA_CHECK(cudaEventCreateWithFlags(&stop, cudaEventDefault));
+    CUDA_CHECK(cudaEventRecord(stop, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, start, stop));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
+    GGML_LOG_INFO("ED_MMQ_PHASE phase=%s elapsed_ms=%.3f m=%" PRId64 " n=%" PRId64 " k=%" PRId64
+                  " src0_type=%s src1_type=%s dst_type=%s src0_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]"
+                  " src1_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] dst_ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "]\n",
+                  phase, elapsed_ms, m, n, k,
+                  ggml_type_name(src0->type), ggml_type_name(src1->type), ggml_type_name(dst->type),
+                  src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                  src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                  dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -137,6 +256,7 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
 
         {
+            cudaEvent_t profile_start = ggml_cuda_mmq_phase_profile_start(stream);
             const int64_t s11 = src1->nb[1] / ts_src1;
             const int64_t s12 = src1->nb[2] / ts_src1;
             const int64_t s13 = src1->nb[3] / ts_src1;
@@ -150,6 +270,7 @@ void ggml_cuda_mul_mat_q(
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
+            ggml_cuda_mmq_phase_profile_stop(profile_start, stream, "quantize_q8_1", src0, src1, dst, ne01, ne1, ne10);
         }
 
         // Stride depends on quantization format
@@ -164,7 +285,9 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             use_stream_k, ne1};
+        cudaEvent_t profile_start = ggml_cuda_mmq_phase_profile_start(stream);
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+        ggml_cuda_mmq_phase_profile_stop(profile_start, stream, "mmq_kernel", src0, src1, dst, ne01, ne1, ne10);
         return;
     }
 
@@ -266,12 +389,14 @@ void ggml_cuda_op_mul_mat_q(
         1, 1, 0, 0, 0,
         use_stream_k, src1_ncols};
 
+    cudaEvent_t profile_start = ggml_cuda_mmq_phase_profile_start(stream);
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+    ggml_cuda_mmq_phase_profile_stop(profile_start, stream, "mmq_kernel_prequantized", src0, src1, dst, row_diff, src1_ncols, ne10);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_padded_row_size, fused_bias);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, int64_t m, int64_t k) {
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, int64_t m, int64_t k, const char * dst_name) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
@@ -314,17 +439,36 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     if (turing_mma_available(cc)) {
 #if !defined(GGML_CUDA_FORCE_MMQ)
         const bool sm90_q4k_cublas_enabled = ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS");
-        const bool h3_mid_seq_shape = ne11 == 7919 && k == 5376 && (m == 28672 || m == 21504);
-        const bool h3_mid_fc2_shape = ne11 == 7919 && m == 5376 && (k == 14336 || k == 7168);
+        const bool h3_mid_seq_range_enabled = ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_QKV_FC1_RANGE", dst_name);
+        const bool h3_mid_qkv_range_enabled = h3_mid_seq_range_enabled ||
+                                              ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_QKV_RANGE", dst_name);
+        const bool h3_mid_fc1_range_enabled = h3_mid_seq_range_enabled ||
+                                              ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC1_RANGE", dst_name);
+        const bool h3_mid_qkv_shape = (ne11 == 7919 || (h3_mid_qkv_range_enabled && ne11 >= 7800 && ne11 <= 8200)) &&
+                                      k == 5376 && m == 21504;
+        const bool h3_mid_fc1_shape = (ne11 == 7919 || (h3_mid_fc1_range_enabled && ne11 >= 7800 && ne11 <= 8200)) &&
+                                      k == 5376 && m == 28672;
+        const bool h3_mid_fc2_range_enabled = ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2_RANGE", dst_name);
+        const bool h3_mid_fc2_shape = (ne11 == 7919 || (h3_mid_fc2_range_enabled && ne11 >= 7800 && ne11 <= 8200)) &&
+                                      m == 5376 && (k == 14336 || k == 7168);
         const bool h3_long_qkv_shape = ne11 >= 16000 && m == 21504 && k == 5376;
         const bool h3_long_fc1_shape = ne11 >= 16000 && m == 28672 && k == 5376;
         const bool h3_long_fc2_shape = ne11 >= 16000 && m == 5376 && (k == 14336 || k == 7168);
         if (sm90_q4k_cublas_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 && type == GGML_TYPE_Q4_K &&
-            (h3_mid_seq_shape ||
-             (ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2") && h3_mid_fc2_shape) ||
+            (h3_mid_qkv_shape ||
+             h3_mid_fc1_shape ||
+             (ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2", dst_name) && h3_mid_fc2_shape) ||
              h3_long_qkv_shape ||
              h3_long_fc1_shape ||
              (!ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_DISABLE_LONG_FC2") && h3_long_fc2_shape))) {
+            if (ggml_cuda_env_flag_enabled("ED_H3_CUBLAS_ROUTE_DEBUG")) {
+                GGML_LOG_INFO("ED_H3_CUBLAS_ROUTE step=%s name=%s ne11=%" PRId64 " m=%" PRId64 " k=%" PRId64
+                              " mid_qkv=%d mid_fc1=%d mid_fc2=%d long_qkv=%d long_fc1=%d long_fc2=%d\n",
+                              std::getenv("ED_MINIMAX_H3_CURRENT_STEP") != nullptr ? std::getenv("ED_MINIMAX_H3_CURRENT_STEP") : "-",
+                              dst_name != nullptr ? dst_name : "", ne11, m, k,
+                              h3_mid_qkv_shape, h3_mid_fc1_shape, h3_mid_fc2_shape,
+                              h3_long_qkv_shape, h3_long_fc1_shape, h3_long_fc2_shape);
+            }
             return false;
         }
 #endif

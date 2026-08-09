@@ -5,7 +5,9 @@
 #include "mma.cuh"
 
 #include <climits>
+#include <cstdlib>
 #include <cstdint>
+#include <inttypes.h>
 
 using namespace ggml_cuda_mma;
 
@@ -3929,6 +3931,16 @@ struct mmq_args {
     bool use_stream_k; int64_t ncols_max;
 };
 
+static bool ed_cuda_mmq_env_flag_enabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static int ed_cuda_mmq_env_int(const char * name, const int default_value) {
+    const char * value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? std::atoi(value) : default_value;
+}
+
 template<ggml_type type>
 static size_t mmq_get_nbytes_shared(const int mmq_x, const int mmq_y, const int cc, const int warp_size, const int nwarps) {
     const tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, mmq_y);
@@ -3998,11 +4010,23 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
+    const bool force_nsm_stream_k = ed_cuda_mmq_env_flag_enabled("ED_MMQ_STREAM_K_FORCE_NSM");
+    const dim3 block_nums_stream_k(!force_nsm_stream_k && GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+
+    if (ed_cuda_mmq_env_flag_enabled("ED_PROFILE_MMQ_PHASES")) {
+        GGML_LOG_INFO("ED_MMQ_TILE type=%s mmq_x=%d mmq_y=%d nwarps=%d nrows_x=%" PRId64 " ncols_max=%" PRId64
+                      " ncols_x=%" PRId64 " ncols_y=%" PRId64 " ncols_dst=%" PRId64
+                      " ntx=%d nty=%d ntzw=%d ntiles_dst=%d nsm=%d stream_k=%d stream_k_blocks=%u"
+                      " tiles_efficiency_percent=%d fixup_needed=%d nbytes_shared=%d\n",
+                      ggml_type_name(type), mmq_x, mmq_y, nwarps, args.nrows_x, args.ncols_max,
+                      args.ncols_x, args.ncols_y, args.ncols_dst,
+                      ntx, nty, ntzw, ntiles_dst, nsm, args.use_stream_k ? 1 : 0, block_nums_stream_k.x,
+                      tiles_efficiency_percent, fixup_needed ? 1 : 0, nbytes_shared);
+    }
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -4078,6 +4102,20 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         if (ntiles_x < ntiles_x_best) {
             mmq_x_best = mmq_x;
             ntiles_x_best = ntiles_x;
+        }
+    }
+
+    const int forced_mmq_x = ed_cuda_mmq_env_int("ED_MMQ_FORCE_X", 0);
+    if (forced_mmq_x != 0) {
+        const int granularity = mmq_get_granularity_host(forced_mmq_x, cc);
+        if (forced_mmq_x >= 8 && forced_mmq_x <= mmq_x_max && forced_mmq_x % 8 == 0 &&
+            forced_mmq_x % granularity == 0 &&
+            mmq_get_nbytes_shared<type>(forced_mmq_x, mmq_y, cc, warp_size, nwarps) <= smpbo) {
+            mmq_x_best = forced_mmq_x;
+        } else if (ed_cuda_mmq_env_flag_enabled("ED_PROFILE_MMQ_PHASES")) {
+            GGML_LOG_INFO("ED_MMQ_FORCE_X_REJECTED type=%s forced=%d mmq_x_max=%d granularity=%d shared=%zu smpbo=%zu\n",
+                          ggml_type_name(type), forced_mmq_x, mmq_x_max, granularity,
+                          mmq_get_nbytes_shared<type>(forced_mmq_x, mmq_y, cc, warp_size, nwarps), smpbo);
         }
     }
 
@@ -4172,4 +4210,4 @@ void ggml_cuda_op_mul_mat_q(
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, const ggml_tensor * fused_bias, cudaStream_t stream);
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, int64_t m = 0, int64_t k = 0);
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, int64_t m = 0, int64_t k = 0, const char * dst_name = nullptr);
