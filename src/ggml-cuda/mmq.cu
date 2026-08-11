@@ -12,6 +12,14 @@ static bool ggml_cuda_env_flag_enabled(const char * name) {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+static bool ggml_cuda_env_flag_enabled_or_default(const char * name, bool default_enabled) {
+    const char * value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_enabled;
+    }
+    return value[0] != '0';
+}
+
 static bool ggml_cuda_env_step_list_contains(const char * name, const int step) {
     const char * value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
@@ -88,6 +96,16 @@ static bool ggml_cuda_h3_scoped_enabled(const char * env_name, const char * dst_
     }
 
     return true;
+}
+
+static int64_t ggml_cuda_h3_q4k_cublas_min_n() {
+    const char * value = std::getenv("ED_MINIMAX_H3_Q4K_CUBLAS_MIN_N");
+    if (value == nullptr || value[0] == '\0') {
+        return 16000;
+    }
+    char * end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    return end != value && parsed > 0 ? parsed : 16000;
 }
 
 static bool ggml_cuda_mmq_phase_profile_enabled() {
@@ -438,7 +456,7 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
     if (turing_mma_available(cc)) {
 #if !defined(GGML_CUDA_FORCE_MMQ)
-        const bool sm90_q4k_cublas_enabled = ggml_cuda_env_flag_enabled("GGML_CUDA_SM90_Q4K_CUBLAS");
+        const bool sm90_q4k_cublas_enabled = ggml_cuda_env_flag_enabled_or_default("GGML_CUDA_SM90_Q4K_CUBLAS", true);
         const bool h3_mid_seq_range_enabled = ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_QKV_FC1_RANGE", dst_name);
         const bool h3_mid_qkv_range_enabled = h3_mid_seq_range_enabled ||
                                               ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_QKV_RANGE", dst_name);
@@ -451,9 +469,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         const bool h3_mid_fc2_range_enabled = ggml_cuda_h3_scoped_enabled("GGML_CUDA_SM90_Q4K_CUBLAS_MID_FC2_RANGE", dst_name);
         const bool h3_mid_fc2_shape = (ne11 == 7919 || (h3_mid_fc2_range_enabled && ne11 >= 7800 && ne11 <= 8200)) &&
                                       m == 5376 && (k == 14336 || k == 7168);
-        const bool h3_long_qkv_shape = ne11 >= 16000 && m == 21504 && k == 5376;
-        const bool h3_long_fc1_shape = ne11 >= 16000 && m == 28672 && k == 5376;
-        const bool h3_long_fc2_shape = ne11 >= 16000 && m == 5376 && (k == 14336 || k == 7168);
+        const int64_t h3_long_min_n = ggml_cuda_h3_q4k_cublas_min_n();
+        const bool h3_long_qkv_shape = ne11 >= h3_long_min_n && m == 21504 && k == 5376;
+        const bool h3_long_fc1_shape = ne11 >= h3_long_min_n && m == 28672 && k == 5376;
+        const bool h3_long_fc2_shape = ne11 >= h3_long_min_n && m == 5376 && (k == 14336 || k == 7168);
         if (sm90_q4k_cublas_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 && type == GGML_TYPE_Q4_K &&
             (h3_mid_qkv_shape ||
              h3_mid_fc1_shape ||
