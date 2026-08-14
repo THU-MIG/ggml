@@ -3656,7 +3656,7 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(ggml_is_contiguous(op->src[0]));
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
+    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_BF16);
 
     const int32_t s0 = ((const int32_t *) op->op_params)[0];
     const int32_t s1 = ((const int32_t *) op->op_params)[1];
