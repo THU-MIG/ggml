@@ -1385,6 +1385,12 @@ extern "C" {
             int                   n_groups,
             float                 eps);
 
+    GGML_API struct ggml_tensor * ggml_group_norm_temporal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_groups,
+            float                 eps);
+
     GGML_API struct ggml_tensor * ggml_group_norm_inplace(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2316,6 +2322,18 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   p0,
             int                   p1);
+
+    GGML_API struct ggml_tensor * ggml_pad_ext_reflect(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   lp0,
+            int                   rp0,
+            int                   lp1,
+            int                   rp1,
+            int                   lp2,
+            int                   rp2,
+            int                   lp3,
+            int                   rp3);
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.

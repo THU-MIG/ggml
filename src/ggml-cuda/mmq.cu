@@ -111,6 +111,23 @@ static bool ggml_cuda_h3_scoped_enabled(const char * env_name, const char * dst_
     return true;
 }
 
+static bool ggml_cuda_h3_scoped_enabled_or_default(const char * env_name, const char * dst_name,
+                                                    const bool default_enabled) {
+    const char * value = std::getenv(env_name);
+    if (value != nullptr && value[0] != '\0') {
+        return value[0] != '0';
+    }
+
+    const std::string step_list_name = std::string(env_name) + "_STEPS";
+    const std::string layer_list_name = std::string(env_name) + "_LAYERS";
+    if (ggml_cuda_env_list_present(step_list_name.c_str()) ||
+        ggml_cuda_env_list_present(layer_list_name.c_str())) {
+        return ggml_cuda_h3_scoped_enabled(env_name, dst_name);
+    }
+
+    return default_enabled;
+}
+
 static int64_t ggml_cuda_h3_q4k_cublas_min_n() {
     const char * value = std::getenv("ED_MINIMAX_H3_Q4K_CUBLAS_MIN_N");
     if (value == nullptr || value[0] == '\0') {
@@ -492,10 +509,20 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         const bool h3_long_qkv_shape = h3_qkv_projection && ne11 >= h3_long_min_n && m == 21504 && k == 5376;
         const bool h3_long_fc1_shape = h3_fc1_projection && ne11 >= h3_long_min_n && m == 28672 && k == 5376;
         const bool h3_long_fc2_shape = h3_fc2_projection && ne11 >= h3_long_min_n && m == 5376 && (k == 14336 || k == 7168);
+        const bool h3_q8_fc2_cublas_enabled =
+            ggml_cuda_h3_scoped_enabled_or_default("GGML_CUDA_SM90_Q8_CUBLAS_FC2", dst_name, true);
         const bool h3_q8_cublas_shape = type == GGML_TYPE_Q8_0 && ne11 >= h3_long_min_n &&
                                         ((h3_qkv_projection && m == 21504 && k == 5376) ||
-                                         (h3_fc1_projection && m == 28672 && k == 5376));
+                                         (h3_fc1_projection && m == 28672 && k == 5376) ||
+                                         (h3_q8_fc2_cublas_enabled && h3_fc2_projection &&
+                                          m == 5376 && (k == 14336 || k == 7168)));
         if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 && h3_q8_cublas_shape) {
+            if (ggml_cuda_env_flag_enabled("ED_H3_CUBLAS_ROUTE_DEBUG")) {
+                GGML_LOG_INFO("ED_H3_Q8_CUBLAS_ROUTE step=%s name=%s ne11=%" PRId64 " m=%" PRId64 " k=%" PRId64
+                              " fc2_enabled=%d\n",
+                              std::getenv("ED_MINIMAX_H3_CURRENT_STEP") != nullptr ? std::getenv("ED_MINIMAX_H3_CURRENT_STEP") : "-",
+                              dst_name != nullptr ? dst_name : "", ne11, m, k, h3_q8_fc2_cublas_enabled);
+            }
             return false;
         }
         if (sm90_q4k_cublas_enabled && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 && type == GGML_TYPE_Q4_K &&

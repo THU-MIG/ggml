@@ -3188,6 +3188,16 @@ struct ggml_tensor * ggml_group_norm(
     return ggml_group_norm_impl(ctx, a, n_groups, eps, false);
 }
 
+struct ggml_tensor * ggml_group_norm_temporal(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_groups,
+        float                 eps) {
+    struct ggml_tensor * result = ggml_group_norm_impl(ctx, a, n_groups, eps, false);
+    ggml_set_op_params_i32(result, 2, 1);
+    return result;
+}
+
 struct ggml_tensor * ggml_group_norm_inplace(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -5114,6 +5124,22 @@ struct ggml_tensor * ggml_pad_ext_circular(
         ) {
     struct ggml_tensor * result = ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
     ggml_set_op_params_i32(result, 8, 1); // circular
+    return result;
+}
+
+struct ggml_tensor * ggml_pad_ext_reflect(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                  lp0,
+        int                  rp0,
+        int                  lp1,
+        int                  rp1,
+        int                  lp2,
+        int                  rp2,
+        int                  lp3,
+        int                  rp3) {
+    struct ggml_tensor * result = ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
+    ggml_set_op_params_i32(result, 8, 2);
     return result;
 }
 

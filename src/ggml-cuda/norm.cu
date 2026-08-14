@@ -154,6 +154,50 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
+template <int block_size>
+static __global__ void group_norm_temporal_f32(const float * x,
+                                               float * dst,
+                                               const int width,
+                                               const int height,
+                                               const int frames,
+                                               const int channels,
+                                               const int num_groups,
+                                               const float eps) {
+    const int frame = blockIdx.x / num_groups;
+    const int group = blockIdx.x % num_groups;
+    const int channels_per_group = (channels + num_groups - 1) / num_groups;
+    const int channel_begin = group * channels_per_group;
+    const int channel_end = min(channel_begin + channels_per_group, channels);
+    const int spatial = width * height;
+    const int group_size = spatial * (channel_end - channel_begin);
+    float sum = 0.0f;
+    for (int index = threadIdx.x; index < group_size; index += block_size) {
+        const int channel = channel_begin + index / spatial;
+        const int pixel = index % spatial;
+        const int64_t offset = pixel + int64_t(spatial) * (frame + frames * channel);
+        sum += x[offset];
+    }
+    extern __shared__ float shared[];
+    sum = block_reduce<block_reduce_method::SUM, block_size>(sum, shared);
+    const float mean = sum / group_size;
+    float squared_sum = 0.0f;
+    for (int index = threadIdx.x; index < group_size; index += block_size) {
+        const int channel = channel_begin + index / spatial;
+        const int pixel = index % spatial;
+        const int64_t offset = pixel + int64_t(spatial) * (frame + frames * channel);
+        const float centered = x[offset] - mean;
+        squared_sum += centered * centered;
+    }
+    squared_sum = block_reduce<block_reduce_method::SUM, block_size>(squared_sum, shared);
+    const float scale = rsqrtf(squared_sum / group_size + eps);
+    for (int index = threadIdx.x; index < group_size; index += block_size) {
+        const int channel = channel_begin + index / spatial;
+        const int pixel = index % spatial;
+        const int64_t offset = pixel + int64_t(spatial) * (frame + frames * channel);
+        dst[offset] = (x[offset] - mean) * scale;
+    }
+}
+
 template <int block_size, bool do_multiply = false, bool do_add = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
@@ -774,6 +818,14 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     float eps;
     memcpy(&eps, dst->op_params + 1, sizeof(float));
     GGML_ASSERT(eps >= 0.0f);
+
+    if (dst->op_params[2] == 1) {
+        constexpr int block_size = 1024;
+        const int blocks = num_groups * src0->ne[2];
+        group_norm_temporal_f32<block_size><<<blocks, block_size, 32 * sizeof(float), stream>>>(
+            src0_d, dst_d, src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3], num_groups, eps);
+        return;
+    }
 
     int group_size = src0->ne[0] * src0->ne[1] * ((src0->ne[2] + num_groups - 1) / num_groups);
     group_norm_f32_cuda(src0_d, dst_d, num_groups * src0->ne[3], eps, group_size, ggml_nelements(src0), stream);
