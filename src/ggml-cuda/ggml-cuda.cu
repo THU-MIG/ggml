@@ -2506,9 +2506,22 @@ static bool ggml_cuda_h3_current_step_enabled(const char * env_name) {
     return ggml_cuda_env_step_list_contains(list_name.c_str(), static_cast<int>(step));
 }
 
+static bool ggml_cuda_h3_projection_name(const ggml_tensor * dst, const char * suffix) {
+    const char * current_step = getenv("ED_MINIMAX_H3_CURRENT_STEP");
+    if (current_step == nullptr || current_step[0] == '\0' ||
+        dst == nullptr || suffix == nullptr ||
+        std::strstr(dst->name, "model.diffusion_model.blocks.") == nullptr) {
+        return false;
+    }
+    const size_t name_length = std::strlen(dst->name);
+    const size_t suffix_length = std::strlen(suffix);
+    return name_length >= suffix_length &&
+           std::strcmp(dst->name + name_length - suffix_length, suffix) == 0;
+}
+
 static int64_t ggml_cuda_h3_q4k_cublas_min_n() {
-    const int value = ggml_cuda_env_int("ED_MINIMAX_H3_Q4K_CUBLAS_MIN_N", 16000);
-    return value > 0 ? value : 16000;
+    const int value = ggml_cuda_env_int("ED_MINIMAX_H3_Q4K_CUBLAS_MIN_N", 15000);
+    return value > 0 ? value : 15000;
 }
 
 static bool ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
@@ -2521,6 +2534,7 @@ static bool ggml_cuda_h3_sm90_q4k_fc2_needs_f32_cublas(const ggml_tensor * src0,
     const int64_t long_seq_min_n = ggml_cuda_h3_q4k_cublas_min_n();
     return GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
            src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           ggml_cuda_h3_projection_name(dst, ".mlp.fc2.weight") &&
            src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            dst->ne[0] == 5376 && (src0->ne[0] == 14336 || src0->ne[0] == 7168) &&
            (src1->ne[1] >= long_seq_min_n ||
@@ -2532,6 +2546,7 @@ static bool ggml_cuda_h3_sm90_q4k_qkv_f32_output(const ggml_tensor * src0, const
     return ggml_cuda_env_flag_enabled_or_default("ED_MINIMAX_H3_QKV_F32_OUTPUT", true) &&
            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
            src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           ggml_cuda_h3_projection_name(dst, ".attn.qkv_proj.weight") &&
            src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src0->ne[0] == 5376 && dst->ne[0] == 21504 && src1->ne[1] >= ggml_cuda_h3_q4k_cublas_min_n();
 }
@@ -2540,6 +2555,7 @@ static bool ggml_cuda_h3_sm90_q4k_fc1_f32_output(const ggml_tensor * src0, const
     return ggml_cuda_env_flag_enabled_or_default("ED_MINIMAX_H3_FC1_F32_OUTPUT", true) &&
            GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= 900 &&
            src0 != nullptr && src1 != nullptr && dst != nullptr &&
+           ggml_cuda_h3_projection_name(dst, ".mlp.fc1.weight") &&
            src0->type == GGML_TYPE_Q4_K && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src0->ne[0] == 5376 && dst->ne[0] == 28672 && src1->ne[1] >= ggml_cuda_h3_q4k_cublas_min_n();
 }
