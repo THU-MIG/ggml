@@ -4082,8 +4082,52 @@ static void ggml_compute_forward_group_norm_f32(
     float eps;
     memcpy(&eps, dst->op_params + 1, sizeof(float));
 
-    int n_channels = src0->ne[2];
     int n_groups = dst->op_params[0];
+    if (dst->op_params[2] == 1) {
+        const int64_t spatial = ne00 * ne01;
+        const int64_t channels_per_group = (ne03 + n_groups - 1) / n_groups;
+        for (int64_t work = ith; work < ne02 * n_groups; work += nth) {
+            const int64_t frame = work / n_groups;
+            const int64_t group = work % n_groups;
+            const int64_t channel_begin = group * channels_per_group;
+            const int64_t channel_end = std::min(channel_begin + channels_per_group, ne03);
+            const int64_t count = spatial * (channel_end - channel_begin);
+            ggml_float sum = 0.0;
+            ggml_float squared_sum = 0.0;
+            for (int64_t channel = channel_begin; channel < channel_end; ++channel) {
+                for (int64_t y = 0; y < ne01; ++y) {
+                    const float * row = (const float *)((const char *) src0->data +
+                        y * nb01 + frame * nb02 + channel * nb03);
+                    for (int64_t x = 0; x < ne00; ++x) sum += row[x];
+                }
+            }
+            const float mean = sum / count;
+            for (int64_t channel = channel_begin; channel < channel_end; ++channel) {
+                for (int64_t y = 0; y < ne01; ++y) {
+                    const float * source = (const float *)((const char *) src0->data +
+                        y * nb01 + frame * nb02 + channel * nb03);
+                    float * output = (float *)((char *) dst->data +
+                        y * nb1 + frame * nb2 + channel * nb3);
+                    for (int64_t x = 0; x < ne00; ++x) {
+                        const float centered = source[x] - mean;
+                        output[x] = centered;
+                        squared_sum += (ggml_float) centered * centered;
+                    }
+                }
+            }
+            const float scale = 1.0f / sqrtf(squared_sum / count + eps);
+            for (int64_t channel = channel_begin; channel < channel_end; ++channel) {
+                for (int64_t y = 0; y < ne01; ++y) {
+                    float * output = (float *)((char *) dst->data +
+                        y * nb1 + frame * nb2 + channel * nb3);
+                    ggml_vec_scale_f32(ne00, output, scale);
+                }
+            }
+        }
+        return;
+    }
+
+    int n_channels = src0->ne[2];
     int n_channels_per_group = (n_channels + n_groups - 1) / n_groups;
     for (int i = ith; i < n_groups; i += nth) {
         int start = i * n_channels_per_group;
@@ -8004,7 +8048,7 @@ void ggml_compute_forward_upscale(
 
 // ggml_compute_forward_pad
 
-template<bool circular_t>
+template<bool circular_t, bool reflect_t = false>
 static void ggml_compute_forward_pad_f32(
     const ggml_compute_params * params,
           ggml_tensor * dst) {
@@ -8035,7 +8079,19 @@ static void ggml_compute_forward_pad_f32(
             for (int64_t i0 = 0; i0 < ne0; ++i0) {
                 for (int64_t i3 = 0; i3 < ne3; ++i3) {
                     // circular means wrap around on a torus, so x and y loop around
-                    if constexpr (circular_t) {
+                    if constexpr (reflect_t) {
+                        const int64_t dst_idx = i3*(ne0*ne1*ne2) + i2*(ne0*ne1) + i1*ne0 + i0;
+                        const int64_t rel0 = i0 - lp0;
+                        const int64_t rel1 = i1 - lp1;
+                        const int64_t rel2 = i2 - lp2;
+                        const int64_t rel3 = i3 - lp3;
+                        const int64_t src_i0 = rel0 < 0 ? -rel0 : (rel0 >= ne00 ? 2*ne00 - 2 - rel0 : rel0);
+                        const int64_t src_i1 = rel1 < 0 ? -rel1 : (rel1 >= ne01 ? 2*ne01 - 2 - rel1 : rel1);
+                        const int64_t src_i2 = rel2 < 0 ? -rel2 : (rel2 >= ne02 ? 2*ne02 - 2 - rel2 : rel2);
+                        const int64_t src_i3 = rel3 < 0 ? -rel3 : (rel3 >= ne03 ? 2*ne03 - 2 - rel3 : rel3);
+                        const int64_t src_idx = src_i3*nb03 + src_i2*nb02 + src_i1*nb01 + src_i0*nb00;
+                        dst_ptr[dst_idx] = *(const float *)((const char *) src0->data + src_idx);
+                    } else if constexpr (circular_t) {
                         const int64_t dst_idx = i3*(ne0*ne1*ne2) + i2*(ne0*ne1) + i1*ne0 + i0;
                         const int64_t src_i0 = ggml_wrap_around(i0 - lp0, ne00);
                         const int64_t src_i1 = ggml_wrap_around(i1 - lp1, ne01);
@@ -8074,11 +8130,13 @@ void ggml_compute_forward_pad(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
-    const bool circular = (bool) ggml_get_op_params_i32(dst, 8);
+    const int32_t pad_mode = ggml_get_op_params_i32(dst, 8);
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
-                if (circular) {
+                if (pad_mode == 2) {
+                    ggml_compute_forward_pad_f32<false, true>(params, dst);
+                } else if (pad_mode == 1) {
                     ggml_compute_forward_pad_f32<true>(params, dst);
                 } else {
                     ggml_compute_forward_pad_f32<false>(params, dst);

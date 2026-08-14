@@ -6464,6 +6464,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         }
 #endif
             ggml_cuda_flash_attn_ext(ctx, dst);
+            if (ggml_cuda_env_flag_enabled_or_default("ED_QWEN_VISION_FLASH_ATTN_SYNC", true) &&
+                dst->ne[0] == 72 && dst->ne[1] == 16 && dst->ne[2] >= 4096 && dst->ne[3] == 1) {
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            }
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS:
             ggml_cuda_cross_entropy_loss(ctx, dst);
