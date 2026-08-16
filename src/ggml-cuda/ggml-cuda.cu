@@ -998,8 +998,47 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static std::atomic<size_t> g_cuda_memory_budgets[GGML_CUDA_MAX_DEVICES] = {};
+static std::mutex g_cuda_memory_budget_mutex;
+
+static bool ggml_cuda_memory_budget_allows_unlocked(int device, size_t allocation_bytes) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    const size_t budget_bytes = g_cuda_memory_budgets[device].load(std::memory_order_relaxed);
+    if (budget_bytes == 0) {
+        return true;
+    }
+    ggml_cuda_set_device(device);
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t used_bytes = total_bytes - free_bytes;
+    return used_bytes <= budget_bytes && allocation_bytes <= budget_bytes - used_bytes;
+}
+
+bool ggml_backend_cuda_memory_budget_allows(int device, size_t allocation_bytes) {
+    std::lock_guard<std::mutex> lock(g_cuda_memory_budget_mutex);
+    return ggml_cuda_memory_budget_allows_unlocked(device, allocation_bytes);
+}
+
+bool ggml_backend_cuda_try_malloc(int device, void ** ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(g_cuda_memory_budget_mutex);
+    if (!ggml_cuda_memory_budget_allows_unlocked(device, size)) {
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    return cudaMalloc(ptr, size) == cudaSuccess;
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
+    std::lock_guard<std::mutex> lock(g_cuda_memory_budget_mutex);
+    if (!ggml_cuda_memory_budget_allows_unlocked(device, size)) {
+        GGML_LOG_ERROR("%s: refusing %.2f MiB allocation on device %d because it exceeds the configured CUDA memory budget\n",
+                       __func__, size / 1024.0 / 1024.0, device);
+        return cudaErrorMemoryAllocation;
+    }
     cudaError_t err;
     if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
         err = cudaMallocManaged(ptr, size);
@@ -1401,7 +1440,15 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = device;
             CUmemGenericAllocationHandle handle;
-            CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            {
+                std::lock_guard<std::mutex> lock(g_cuda_memory_budget_mutex);
+                if (!ggml_cuda_memory_budget_allows_unlocked(device, reserve_size)) {
+                    GGML_ABORT("CUDA pool allocation of %.2f MiB exceeds the configured memory budget on device %d",
+                               reserve_size / 1024.0 / 1024.0,
+                               device);
+                }
+                CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
+            }
 
             // reserve virtual address space (if not already reserved)
             if (pool_addr == 0) {
@@ -9435,6 +9482,31 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     };
 
     return cuda_backend;
+}
+
+bool ggml_backend_cuda_set_memory_budget(ggml_backend_t backend, size_t budget_bytes) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    if (ctx == nullptr || ctx->device < 0 || ctx->device >= GGML_CUDA_MAX_DEVICES) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_cuda_memory_budget_mutex);
+    ggml_cuda_set_device(ctx->device);
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+    const size_t used_bytes = total_bytes - free_bytes;
+    if (budget_bytes > 0 && used_bytes > budget_bytes) {
+        GGML_LOG_ERROR("%s: device %d already uses %.2f GiB, above requested %.2f GiB budget\n",
+                       __func__, ctx->device,
+                       used_bytes / 1024.0 / 1024.0 / 1024.0,
+                       budget_bytes / 1024.0 / 1024.0 / 1024.0);
+        return false;
+    }
+    g_cuda_memory_budgets[ctx->device].store(budget_bytes, std::memory_order_relaxed);
+    return true;
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
